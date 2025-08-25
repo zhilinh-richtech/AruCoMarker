@@ -8,9 +8,9 @@ import pyrealsense2 as rs
 
 # 这个脚本用来获取深度相机的的坐标转换，但是没来得及测试是否准确。
 # ----------------- Config -----------------
-XARM_IP = '192.168.2.112'  #
+XARM_IP = '192.168.10.201'  # 192.168.2.112
 ARUCO_DICT = cv2.aruco.DICT_4X4_250
-MARKER_LENGTH = 0.05  # Marker side length in meters
+MARKER_LENGTH = 0.07  # Marker side length in meters
 save_dir = 'output_depth'
 
 # ----------------- Functions -----------------
@@ -77,9 +77,9 @@ dist_coeffs = np.array(intrinsics.coeffs)
 print("[INFO] RealSense Camera Intrinsics:")
 print("Camera Matrix:\n", camera_matrix)
 print("Distortion Coeffs:\n", dist_coeffs)
-np.savez(os.path.join(save_dir, "charuco_calibration.npz"),
-             camera_matrix=camera_matrix,
-             dist_coeffs=dist_coeffs)
+# np.savez(os.path.join(save_dir, "charuco_calibration.npz"),
+#              camera_matrix=camera_matrix,
+#              dist_coeffs=dist_coeffs)
 
 
 
@@ -161,15 +161,18 @@ if pose_count >= 3:
     )
 
     T_cam_gripper = to_homogeneous(R_cam2gripper, t_cam2gripper)
-    T_gripper_cam = np.linalg.inv(T_cam_gripper)
+    # T_gripper_cam = np.linalg.inv(T_cam_gripper)
 
     print("\n=== Calibration result ===")
     print("T_cam_gripper (Camera to Gripper):\n", T_cam_gripper)
-    print("\nT_gripper_cam (Gripper to Camera):\n", T_gripper_cam)
+    # print("\nT_gripper_cam (Gripper to Camera):\n", T_gripper_cam)
 
-    np.savez(f'./{save_dir}/eye_to_hand_calibration.npz',
-             T_cam_gripper=T_cam_gripper,
-             T_gripper_cam=T_gripper_cam)
+    # np.savez(f'./{save_dir}/eye_to_hand_calibration.npz',
+    #          T_cam_gripper=T_cam_gripper,
+    #          T_gripper_cam=T_gripper_cam)
+    np.savez(f'eye_to_hand_calibration.npz',
+             T_cam_gripper=T_cam_gripper)
+            #  T_gripper_cam=T_gripper_cam)
 else:
     print("Not enough poses collected! Need at least 3.")
 
