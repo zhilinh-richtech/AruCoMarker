@@ -1,0 +1,16 @@
+# Core dependencies for ArUco marker detection and RealSense camera
+# Note: Use --index-url https://pypi.org/simple/ if custom pip index doesn't have these packages
+opencv-python==4.12.0.88
+opencv-contrib-python==4.12.0.88
+numpy==2.0.2
+pyrealsense2==2.56.5.9235
+
+# xArm robot control
+xarm==0.0.4
+
+# Additional useful packages for computer vision
+matplotlib>=3.9.4
+scipy>=1.13.1
+
+# Installation command:
+# pip3 install --index-url https://pypi.org/simple/ -r requirements.txt
