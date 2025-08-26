@@ -39,7 +39,7 @@ AXIS_LEN_M       = 0.08
 SAVE_NPY         = "handeye_result_stereo.npy"
 
 # Incremental-capture controls
-BATCH_SIZE       = 3
+BATCH_SIZE       = 1
 OUTPUT_DIR       = os.path.join(os.path.dirname(__file__), "../output/captures")
 
 # Load RealSense intrinsics/distortion from calibration file
@@ -289,27 +289,53 @@ class XArmClient:
     def close(self):
         try: self.arm.disconnect()
         except Exception: pass
+    def get_position(self):
+        code, pos = self.arm.get_position(is_radian=not USE_DEG)
+        if code != 0:
+            raise RuntimeError(f"xArm get_position failed, code={code}")
+        return pos
 
 # =========================
-# Residual diagnostics
+# Simple helpers
 # =========================
-def handeye_residuals(Rg, tg, Rt, tt, R_cam2base, t_cam2base):
-    X = se3(R_cam2base, t_cam2base)
-    rots, trans = [], []
-    for i in range(len(Rg) - 1):
-        RA, tA = rel_motion(Rg[i], tg[i], Rg[i+1], tg[i+1])
-        RB, tB = rel_motion(Rt[i+1], tt[i+1], Rt[i], tt[i])  # inverse order
-        L = se3(RA, tA) @ X
-        Rhs = X @ se3(RB, tB)
-        dR = L[:3,:3].T @ Rhs[:3,:3]
-        dtheta = rot_angle_deg(dR)
-        dt = np.linalg.norm(L[:3,3] - Rhs[:3,3])
-        rots.append(dtheta); trans.append(dt)
-    if not rots: return None
-    def stats(a): a=np.array(a); return dict(mean=float(np.mean(a)),
-                                            median=float(np.median(a)),
-                                            p95=float(np.percentile(a,95)))
-    return dict(rot_deg=stats(rots), trans_m=stats(trans))
+
+def _to_homogeneous(R, t):
+    T = np.eye(4, dtype=np.float64)
+    T[:3,:3] = R
+    T[:3,3]  = v3(t)           # <- handles (3,), (3,1), or (1,3)
+    return T
+
+
+def _invert_se3(T):
+    R = T[:3,:3]; t = T[:3,3]
+    RT = R.T
+    Ti = np.eye(4, dtype=np.float64)
+    Ti[:3,:3] = RT
+    Ti[:3,3] = -RT @ t
+    return Ti
+
+def _matrix_to_rpy(R):
+    sy = np.sqrt(R[0,0]**2 + R[1,0]**2)
+    singular = sy < 1e-6
+    if not singular:
+        roll  = np.arctan2(R[2,1], R[2,2])
+        pitch = np.arctan2(-R[2,0], sy)
+        yaw   = np.arctan2(R[1,0], R[0,0])
+    else:
+        roll  = np.arctan2(-R[1,2], R[1,1])
+        pitch = np.arctan2(-R[2,0], sy)
+        yaw   = 0.0
+    return np.degrees([roll, pitch, yaw])
+def v3(x):
+    x = np.asarray(x, dtype=np.float64)
+    return x.reshape(3) if x.size == 3 else x.squeeze().reshape(3)
+
+def get_abs(listOfThree):
+    try:
+        result = abs(listOfThree[0]) + abs(listOfThree[1]) + abs(listOfThree[2])
+        return result
+    except Exception as e:
+        print("Failed with get abs",e)
     
 # =========================
 # Main
@@ -340,6 +366,9 @@ def main():
     last_Rg, last_tg = None, None
 
     try:
+        prev_xyz_result = None
+        prev_rpy_result = None
+        current = 0
         while True:
             ok, color = rs_cam.read()
             if not ok or color is None:
@@ -399,31 +428,59 @@ def main():
                     R_t2c_list.append(R); t_t2c_list.append(t)
                     last_Rg, last_tg = R_gb, t_gb
                     print(f"Captured #{len(R_g2b_list)}  (markers:{ch_state['last_markers']}, charuco:{ch_state['last_charuco']})  → saved {os.path.basename(img_path)}")
-
+                    current += 1
                     # After every BATCH_SIZE captures, run an incremental calibration preview
-                    if len(R_g2b_list) >= BATCH_SIZE and (len(R_g2b_list) % BATCH_SIZE == 0):
+                    if len(R_g2b_list) >= BATCH_SIZE and (len(R_g2b_list) % BATCH_SIZE == 0) and current > 3:
                         try:
                             Rg_prev, tg_prev = to_cv_lists(R_g2b_list, t_g2b_list)
                             Rt_prev, tt_prev = to_cv_lists(R_t2c_list, t_t2c_list)
+                            # --- preview block ---
                             R_cam2base_prev, t_cam2base_prev = cv2.calibrateHandEye(
                                 R_gripper2base=Rg_prev, t_gripper2base=tg_prev,
                                 R_target2cam=Rt_prev,  t_target2cam=tt_prev,
                                 method=cv2.CALIB_HAND_EYE_PARK
                             )
-                            t_cam2base_prev = t_cam2base_prev.reshape(3)
-                            T_base_cam_prev = np.eye(4); T_base_cam_prev[:3,:3]=R_cam2base_prev; T_base_cam_prev[:3,3]=t_cam2base_prev
+                            t_cam2base_prev = v3(t_cam2base_prev)
 
-                            # Compute residuals on current set
-                            res_prev = handeye_residuals(Rg_prev, tg_prev, Rt_prev, tt_prev, R_cam2base_prev, t_cam2base_prev)
+                            T_base_cam_prev = np.eye(4)
+                            T_base_cam_prev[:3,:3] = R_cam2base_prev
+                            T_base_cam_prev[:3,3]  = t_cam2base_prev  # <- column expects (3,), not (3,1)
 
                             np.set_printoptions(precision=6, suppress=True)
                             print("\n=== Preview T_base_cam after {0} captures ===".format(len(R_g2b_list)))
                             print(T_base_cam_prev)
-                            if res_prev:
-                                print("Residuals: "
-                                      f"rot mean={res_prev['rot_deg']['mean']:.3f}°, med={res_prev['rot_deg']['median']:.3f}°, p95={res_prev['rot_deg']['p95']:.3f}°; "
-                                      f"trans mean={res_prev['trans_m']['mean']:.4f} m, med={res_prev['trans_m']['median']:.4f} m, p95={res_prev['trans_m']['p95']:.4f} m")
+                            # MoveArm3-style prints (match labels and values)
+                            try:
+                                charucoToCam = _to_homogeneous(R_t2c_list[-1], t_t2c_list[-1])  # Camera ← Board
+                                gripperToCam = T_base_cam_prev @ charucoToCam                 # (label matches MoveArm3)
 
+                                # Actual Base ← EE from robot
+                                R_bg_last, t_bg_last = invert_rt(R_g2b_list[-1], t_g2b_list[-1])
+                                T_base_gripper = _to_homogeneous(R_bg_last, t_bg_last)
+
+                                print("gripper to base")
+                                print(T_base_gripper)
+                                print("calculated gripper to cam")
+                                print(gripperToCam)
+
+                                actual_rpy = _matrix_to_rpy(T_base_gripper)
+                                actual_xyz = T_base_gripper[:3, 3] * 1000
+                                estimated_rpy = _matrix_to_rpy(gripperToCam)
+                                estimated_xyz = gripperToCam[:3, 3] * 1000
+                                print(actual_xyz)
+                                print(estimated_xyz)
+                                print(actual_xyz - estimated_xyz)
+                                print(actual_rpy - estimated_rpy)
+                                if prev_xyz_result is not None and prev_rpy_result is not None:
+                                    print("into our statement")
+                                    print("this is the absoule vaule of prev xyz result", get_abs(prev_xyz_result))
+                                    print("this is the absoule vaule of prev rpy result", get_abs(prev_rpy_result))
+                                    print("this is the absoule vaule of curr xyz result", get_abs(actual_xyz - estimated_xyz))
+                                    print("this is the absoule vaule of curr rpy result", get_abs(actual_rpy - estimated_rpy))
+
+                                
+                            except Exception as e:
+                                print(f"⚠️  Preview evaluation failed: {e}")
                             # Save the preview so MoveArm3 can be run immediately for evaluation
                             try:
                                 np.savez(os.path.join(os.path.dirname(__file__), "../output/markercalibration.npz"),
@@ -431,15 +488,28 @@ def main():
                             except Exception as e:
                                 print(f"⚠️  Failed to save preview calibration: {e}")
 
-                            print("Press 'd' to discard the last {0} captures, any other key to keep.".format(BATCH_SIZE))
-                            k = cv2.waitKey(0) & 0xFF
-                            if k == ord('d'):
+                            def _vec(x):
+                                return np.atleast_1d(np.asarray(x)).reshape(-1)
+
+                            # Compute current absolute errors (vectors)
+                            cur_xyz_err = np.abs(_vec(actual_xyz) - _vec(estimated_xyz))
+                            cur_rpy_err = np.abs(_vec(actual_rpy) - _vec(estimated_rpy))
+
+                            # Determine if we should discard the last batch
+                            if (prev_xyz_result is not None) and (prev_rpy_result is not None):
+                                prev_xyz_err = np.abs(_vec(prev_xyz_result))
+                                prev_rpy_err = np.abs(_vec(prev_rpy_result))
+                                # "worse or equal" in every component -> discard
+                                should_discard = np.all(prev_xyz_err <= cur_xyz_err) and np.all(prev_rpy_err <= cur_rpy_err)
+                            else:
+                                should_discard = False
+
+                            if should_discard:
                                 # Remove last batch from memory and delete image files
                                 for _ in range(BATCH_SIZE):
                                     if R_g2b_list:
                                         R_g2b_list.pop(); t_g2b_list.pop()
                                         R_t2c_list.pop(); t_t2c_list.pop()
-                                    # Remove last saved image
                                     if saved_images:
                                         path_to_remove = saved_images.pop()
                                         try:
@@ -448,14 +518,20 @@ def main():
                                                 print(f"Removed {os.path.basename(path_to_remove)}")
                                         except Exception as e:
                                             print(f"⚠️  Failed removing image: {e}")
+
                                 # Update last_Rg/last_tg to new tail
-                                if R_g2b_list:
-                                    last_Rg, last_tg = R_g2b_list[-1], t_g2b_list[-1]
-                                else:
-                                    last_Rg, last_tg = None, None
+                                last_Rg, last_tg = (R_g2b_list[-1], t_g2b_list[-1]) if R_g2b_list else (None, None)
                                 print(f"Discarded last {BATCH_SIZE} captures. Current count: {len(R_g2b_list)}")
                             else:
+                                # Update prev_* only if meaningfully changed
+                                new_xyz = _vec(actual_xyz) - _vec(estimated_xyz)
+                                new_rpy = _vec(actual_rpy) - _vec(estimated_rpy)
+                                if (prev_xyz_result is None) or (not np.allclose(prev_xyz_result, new_xyz, rtol=1e-6, atol=1e-9)):
+                                    prev_xyz_result = new_xyz
+                                if (prev_rpy_result is None) or (not np.allclose(prev_rpy_result, new_rpy, rtol=1e-6, atol=1e-9)):
+                                    prev_rpy_result = new_rpy
                                 print("Kept captures.")
+
                         except Exception as e:
                             print(f"⚠️  Preview calibration failed: {e}")
     finally:
@@ -485,11 +561,26 @@ def main():
     np.savez("../output/markercalibration.npz",
     last_mark = T_base_cam)
 
-    res = handeye_residuals(Rg, tg, Rt, tt, R_cam2base, t_cam2base)
-    if res:
-        print("\nResiduals: "
-              f"rot mean={res['rot_deg']['mean']:.3f}°, med={res['rot_deg']['median']:.3f}°, p95={res['rot_deg']['p95']:.3f}°; "
-              f"trans mean={res['trans_m']['mean']:.4f} m, med={res['trans_m']['median']:.4f} m, p95={res['trans_m']['p95']:.4f} m")
+    # MoveArm3-style prints at the end using the last capture
+    try:
+        charucoToCam = _to_homogeneous(R_t2c_list[-1], t_t2c_list[-1])
+        gripperToCam = T_base_cam @ charucoToCam
+        R_bg_last, t_bg_last = invert_rt(R_g2b_list[-1], t_g2b_list[-1])
+        T_base_gripper = _to_homogeneous(R_bg_last, t_bg_last)
+        print("gripper to base")
+        print(T_base_gripper)
+        print("calculated gripper to cam")
+        print(gripperToCam)
+        actual_rpy = _matrix_to_rpy(T_base_gripper)
+        actual_xyz = T_base_gripper[:3, 3] * 1000
+        estimated_rpy = _matrix_to_rpy(gripperToCam)
+        estimated_xyz = gripperToCam[:3, 3] * 1000
+        print(actual_xyz)
+        print(estimated_xyz)
+        print(actual_xyz - estimated_xyz)
+        print(actual_rpy - estimated_rpy)
+    except Exception as e:
+        print(f"⚠️  Final evaluation failed: {e}")
 
     np.save(SAVE_NPY, {
         "resolution": (REALSENSE_WIDTH, REALSENSE_HEIGHT),
@@ -503,7 +594,7 @@ def main():
         "K": K, "dist": dist,
         "R_base_cam": R_cam2base, "t_base_cam": t_cam2base,
         "T_base_cam": T_base_cam,
-        "residuals": res,
+        "residuals": None,
         "captures": len(R_g2b_list)
     }, allow_pickle=True)
     print(f"\nSaved → {SAVE_NPY}")
