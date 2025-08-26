@@ -10,19 +10,22 @@ XARM_IP = '192.168.10.201'
 # ---- ChArUco board parameters (must match your printed board) ----
 CHARUCO_SQUARES_X = 5       # columns (X across)
 CHARUCO_SQUARES_Y = 7       # rows    (Y down)
-SQUARE_LEN_M      = 0.025   # square side (meters)
+SQUARE_LEN_M      = 0.02474
 MARKER_LEN_RATIO  = 0.78
 MARKER_LEN_M      = SQUARE_LEN_M * MARKER_LEN_RATIO
 AXIS_LEN_M        = 0.08
 
 # ----------------- Load calibration -----------------
 # Your file stores Base <- Camera, and you print it as "base to cam"
-data = np.load('./output/eye_to_hand_calibration.npz')
-T_cam_base = data['T_cam_base'].astype(np.float64)  # Base ← Camera
-T_cam_base = np.array([[-0.485640, -0.046774, -0.872906,  0.518952],
-    [ 0.857843, -0.217526, -0.465604,  0.368683],
-    [-0.168101, -0.974933,  0.145764,  0.130215],
-    [ 0.000000,  0.000000,  0.000000,  1.000000]])
+data = np.load('../output/eye_to_hand_calibration.npz')
+mark = np.load("../output/markercalibration.npz")
+T_cam_base = mark['last_mark'].astype(np.float64)  # Base ← Camera
+print(T_cam_base)
+#T_cam_base = data['T_cam_base']  # Base ← Camera
+# T_cam_base = np.array([[-0.99504,  -0.005857 ,-0.099307,  0.446634],
+#  [ 0.099255, -0.125581 ,-0.987106 , 1.065138],
+#  [-0.00669 , -0.992066,  0.125539 , 0.146064],
+#     [ 0.000000,  0.000000,  0.000000,  1.000000]])
 
 print("T_cam_base:\n", T_cam_base)
 
@@ -31,12 +34,12 @@ arm = XArmAPI(XARM_IP)
 arm.motion_enable(True)
 
 # ----------------- Load camera intrinsics -----------------
-with np.load("./output/realsense_calibration.npz") as data:
+with np.load("../output/realsense_calibration.npz") as data:
     K    = data["camera_matrix"].astype(np.float64)
     dist = data["dist_coeffs"].astype(np.float64)
 
 # ----------------- RealSense color stream -----------------
-REALSENSE_WIDTH, REALSENSE_HEIGHT, REALSENSE_FPS = 640, 480, 30
+REALSENSE_WIDTH, REALSENSE_HEIGHT, REALSENSE_FPS = 1280, 800, 30
 pipeline = rs.pipeline()
 cfg = rs.config()
 cfg.enable_stream(rs.stream.color, REALSENSE_WIDTH, REALSENSE_HEIGHT, rs.format.bgr8, REALSENSE_FPS)

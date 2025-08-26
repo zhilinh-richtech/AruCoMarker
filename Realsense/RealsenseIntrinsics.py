@@ -5,8 +5,8 @@ import numpy as np
 pipeline = rs.pipeline()
 config = rs.config()
 # ⚠️ Use the same resolution you will run detection at!
-config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
-config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+config.enable_stream(rs.stream.color, 1280, 800, rs.format.bgr8, 30)
+# config.enable_stream(rs.stream.depth, 1280, 800, rs.format.z16, 30)
 pipeline.start(config)
 
 # Get active profiles
@@ -27,7 +27,7 @@ K = np.array([
 dist = np.array(color_intrinsics.coeffs)
 
 # Save intrinsics to .npz
-np.savez("output/realsense_calibration.npz",
+np.savez("../output/realsense_calibration.npz",
          camera_matrix=K,
          dist_coeffs=dist)
 
