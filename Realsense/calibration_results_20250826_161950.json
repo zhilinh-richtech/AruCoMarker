@@ -1,0 +1,16 @@
+{
+  "metadata": {
+    "timestamp": "2025-08-26T16:19:50.453938",
+    "error_threshold_mm": 1.0,
+    "total_sets": 1,
+    "successful": false
+  },
+  "calibration_sets": [
+    {
+      "set_number": 1,
+      "shots": [],
+      "avg_abs_sum_mm": NaN,
+      "timestamp": "2025-08-26T16:02:52.650526"
+    }
+  ]
+}

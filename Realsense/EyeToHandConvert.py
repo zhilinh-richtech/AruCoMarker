@@ -6,7 +6,6 @@ from xarm.wrapper import XArmAPI
 
 # ...existing imports...
 import pyrealsense2 as rs
-import os
 
 # =========================
 # CONFIG
@@ -37,10 +36,6 @@ TARGET_SAMPLES   = 20
 
 AXIS_LEN_M       = 0.08
 SAVE_NPY         = "handeye_result_stereo.npy"
-
-# Incremental-capture controls
-BATCH_SIZE       = 3
-OUTPUT_DIR       = os.path.join(os.path.dirname(__file__), "../output/captures")
 
 # Load RealSense intrinsics/distortion from calibration file
 calib = np.load("../output/realsense_calibration.npz")
@@ -311,6 +306,8 @@ def handeye_residuals(Rg, tg, Rt, tt, R_cam2base, t_cam2base):
                                             p95=float(np.percentile(a,95)))
     return dict(rot_deg=stats(rots), trans_m=stats(trans))
     
+    # Keeping residuals only; defer detailed validation to MoveArm3.py
+    
 # =========================
 # Main
 # =========================
@@ -330,12 +327,6 @@ def main():
     ch_state = make_charuco_state()
     R_g2b_list, t_g2b_list = [], []
     R_t2c_list, t_t2c_list = [], []
-
-    # Ensure output dir for captured images exists
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-    # Track saved image filenames to allow discarding the last batch
-    saved_images = []
 
     last_Rg, last_tg = None, None
 
@@ -384,80 +375,11 @@ def main():
                         accept = False
 
                 if accept:
-                    # Save capture image
-                    capture_idx = len(R_g2b_list) + 1
-                    img_path = os.path.join(OUTPUT_DIR, f"capture_{capture_idx:02d}.png")
-                    try:
-                        cv2.imwrite(img_path, color)
-                        saved_images.append(img_path)
-                    except Exception as e:
-                        print(f"⚠️  Failed to save image: {e}")
-
-                    # Accumulate hand-eye data
                     R_g2b_list.append(R_gb); t_g2b_list.append(t_gb)
                     R, t = det
                     R_t2c_list.append(R); t_t2c_list.append(t)
                     last_Rg, last_tg = R_gb, t_gb
-                    print(f"Captured #{len(R_g2b_list)}  (markers:{ch_state['last_markers']}, charuco:{ch_state['last_charuco']})  → saved {os.path.basename(img_path)}")
-
-                    # After every BATCH_SIZE captures, run an incremental calibration preview
-                    if len(R_g2b_list) >= BATCH_SIZE and (len(R_g2b_list) % BATCH_SIZE == 0):
-                        try:
-                            Rg_prev, tg_prev = to_cv_lists(R_g2b_list, t_g2b_list)
-                            Rt_prev, tt_prev = to_cv_lists(R_t2c_list, t_t2c_list)
-                            R_cam2base_prev, t_cam2base_prev = cv2.calibrateHandEye(
-                                R_gripper2base=Rg_prev, t_gripper2base=tg_prev,
-                                R_target2cam=Rt_prev,  t_target2cam=tt_prev,
-                                method=cv2.CALIB_HAND_EYE_PARK
-                            )
-                            t_cam2base_prev = t_cam2base_prev.reshape(3)
-                            T_base_cam_prev = np.eye(4); T_base_cam_prev[:3,:3]=R_cam2base_prev; T_base_cam_prev[:3,3]=t_cam2base_prev
-
-                            # Compute residuals on current set
-                            res_prev = handeye_residuals(Rg_prev, tg_prev, Rt_prev, tt_prev, R_cam2base_prev, t_cam2base_prev)
-
-                            np.set_printoptions(precision=6, suppress=True)
-                            print("\n=== Preview T_base_cam after {0} captures ===".format(len(R_g2b_list)))
-                            print(T_base_cam_prev)
-                            if res_prev:
-                                print("Residuals: "
-                                      f"rot mean={res_prev['rot_deg']['mean']:.3f}°, med={res_prev['rot_deg']['median']:.3f}°, p95={res_prev['rot_deg']['p95']:.3f}°; "
-                                      f"trans mean={res_prev['trans_m']['mean']:.4f} m, med={res_prev['trans_m']['median']:.4f} m, p95={res_prev['trans_m']['p95']:.4f} m")
-
-                            # Save the preview so MoveArm3 can be run immediately for evaluation
-                            try:
-                                np.savez(os.path.join(os.path.dirname(__file__), "../output/markercalibration.npz"),
-                                         last_mark=T_base_cam_prev)
-                            except Exception as e:
-                                print(f"⚠️  Failed to save preview calibration: {e}")
-
-                            print("Press 'd' to discard the last {0} captures, any other key to keep.".format(BATCH_SIZE))
-                            k = cv2.waitKey(0) & 0xFF
-                            if k == ord('d'):
-                                # Remove last batch from memory and delete image files
-                                for _ in range(BATCH_SIZE):
-                                    if R_g2b_list:
-                                        R_g2b_list.pop(); t_g2b_list.pop()
-                                        R_t2c_list.pop(); t_t2c_list.pop()
-                                    # Remove last saved image
-                                    if saved_images:
-                                        path_to_remove = saved_images.pop()
-                                        try:
-                                            if os.path.exists(path_to_remove):
-                                                os.remove(path_to_remove)
-                                                print(f"Removed {os.path.basename(path_to_remove)}")
-                                        except Exception as e:
-                                            print(f"⚠️  Failed removing image: {e}")
-                                # Update last_Rg/last_tg to new tail
-                                if R_g2b_list:
-                                    last_Rg, last_tg = R_g2b_list[-1], t_g2b_list[-1]
-                                else:
-                                    last_Rg, last_tg = None, None
-                                print(f"Discarded last {BATCH_SIZE} captures. Current count: {len(R_g2b_list)}")
-                            else:
-                                print("Kept captures.")
-                        except Exception as e:
-                            print(f"⚠️  Preview calibration failed: {e}")
+                    print(f"Captured #{len(R_g2b_list)}  (markers:{ch_state['last_markers']}, charuco:{ch_state['last_charuco']})")
     finally:
         cv2.destroyAllWindows()
         rs_cam.close()
@@ -490,6 +412,8 @@ def main():
         print("\nResiduals: "
               f"rot mean={res['rot_deg']['mean']:.3f}°, med={res['rot_deg']['median']:.3f}°, p95={res['rot_deg']['p95']:.3f}°; "
               f"trans mean={res['trans_m']['mean']:.4f} m, med={res['trans_m']['median']:.4f} m, p95={res['trans_m']['p95']:.4f} m")
+
+    # Detailed validation is handled in MoveArm3.py
 
     np.save(SAVE_NPY, {
         "resolution": (REALSENSE_WIDTH, REALSENSE_HEIGHT),
