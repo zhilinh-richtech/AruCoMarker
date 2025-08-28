@@ -8,6 +8,7 @@ from xarm.wrapper import XArmAPI
 import pyrealsense2 as rs
 import os
 from utils import rpy_to_matrix, rot_angle_deg, to_homogeneous, invert_rt, to_cv_lists, rel_motion
+from camera import create_camera
 
 # =========================
 # CONFIG
@@ -65,22 +66,14 @@ def euler_rpy_to_R(roll, pitch, yaw, degrees=True):
 # RealSense source
 # =========================
 class RealSenseSource:
-    def __init__(self, width=1280, height=800, fps=30):
-        self.pipeline = rs.pipeline()
-        config = rs.config()
-        config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
-        self.pipeline.start(config)
+    def __init__(self, width=1280, height=800, fps=30, camera_kind: str = "auto"):
+        self.cam = create_camera(kind=camera_kind, width=width, height=height, fps=fps)
 
     def read(self):
-        frames = self.pipeline.wait_for_frames()
-        color_frame = frames.get_color_frame()
-        if not color_frame:
-            return False, None
-        color_image = np.asanyarray(color_frame.get_data())
-        return True, color_image
+        return self.cam.read()
 
     def close(self):
-        self.pipeline.stop()
+        self.cam.close()
 
 
 # =========================
@@ -308,7 +301,7 @@ def main():
     print("• Press [SPACE] to capture, [q] to finish.\n")
 
     print("Opening RealSense...")
-    rs_cam = RealSenseSource(REALSENSE_WIDTH, REALSENSE_HEIGHT, REALSENSE_FPS)
+    rs_cam = RealSenseSource(REALSENSE_WIDTH, REALSENSE_HEIGHT, REALSENSE_FPS, camera_kind="auto")
 
     print("Connecting xArm...")
     xarm = XArmClient(XARM_IP)

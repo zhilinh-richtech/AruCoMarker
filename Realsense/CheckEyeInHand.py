@@ -2,6 +2,7 @@
 import numpy as np
 import cv2
 import pyrealsense2 as rs
+from camera import create_camera
 from utils import (
     draw_axes_custom,
     to_homogeneous,
@@ -43,10 +44,7 @@ with np.load("../output/realsense_calibration.npz") as data_cal:
 
 # ----------------- RealSense color stream -----------------
 REALSENSE_WIDTH, REALSENSE_HEIGHT, REALSENSE_FPS = 1280, 800, 30
-pipeline = rs.pipeline()
-cfg = rs.config()
-cfg.enable_stream(rs.stream.color, REALSENSE_WIDTH, REALSENSE_HEIGHT, rs.format.bgr8, REALSENSE_FPS)
-pipeline.start(cfg)
+cam = create_camera(kind="auto", width=REALSENSE_WIDTH, height=REALSENSE_HEIGHT, fps=REALSENSE_FPS)
 
 # ----------------- Helpers -----------------
 # Use shared utilities from utils.py
@@ -68,11 +66,9 @@ def euler_rpy_to_R(roll, pitch, yaw, degrees=True):
 # ----------------- Main loop -----------------
 try:
     while True:
-        frames = pipeline.wait_for_frames()
-        color_frame = frames.get_color_frame()
-        if not color_frame:
+        ok, frame = cam.read()
+        if not ok or frame is None:
             continue
-        frame = np.asanyarray(color_frame.get_data())
 
         # Detect single ArUco
         corners, ids, _ = detector.detectMarkers(frame)
@@ -130,10 +126,8 @@ try:
 
 finally:
     cv2.destroyAllWindows()
-    try:
-        pipeline.stop()
-    except:
-        pass
+    try: cam.close()
+    except: pass
     try:
         arm.disconnect()
     except:
