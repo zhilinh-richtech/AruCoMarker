@@ -18,10 +18,10 @@ data = np.load('../output/poses/result.npy', allow_pickle=True)
 #T_cam_base = data['T_cam2grip'].astype(np.float64)  # Base ← Camera
 # If you want to override with a fixed matrix, uncomment and edit:
 T_cam_base = np.array([
-    [0.51097,  -0.559244,  0.652806, -1.189456],
-    [0.742469, -0.095573, -0.663027, -1.593206],
-    [0.433185,  0.823476,  0.366386,  0.600184],
-    [0.0,       0.0,       0.0,       1.0]
+    [-0.011733, -0.999899, -0.008041,  0.07153 ],
+    [ 0.999915, -0.011778,  0.005573,  0.011725],
+    [-0.005668, -0.007975,  0.999952, -0.131624],
+    [ 0.0,       0.0,       0.0,       1.0     ]
 ])
 
 
