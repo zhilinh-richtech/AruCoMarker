@@ -73,22 +73,63 @@ def make_detector_params(aruco_dict):
         return params, None
 
 def interpolate_charuco(corners, ids, gray, board, K, dist):
+    # Optional: refine to board geometry (helps a lot)
+    try:
+        cv2.aruco.refineDetectedMarkers(
+            image=gray, board=board, detectedCorners=corners, detectedIds=ids,
+            rejectedCorners=None, cameraMatrix=K, distCoeffs=dist
+        )
+    except Exception:
+        pass
+
     out = cv2.aruco.interpolateCornersCharuco(corners, ids, gray, board, K, dist)
     if isinstance(out, tuple) and len(out) >= 2:
-        return out[0], out[1]
-    return out, None
+        charuco_corners, charuco_ids = out[0], out[1]
+    else:
+        charuco_corners, charuco_ids = out, None
 
-def estimate_charuco_pose(charuco_corners, charuco_ids, board, K, dist) -> Tuple[bool, np.ndarray, np.ndarray]:
+    # Normalize outputs
+    if charuco_corners is None or charuco_ids is None:
+        return None, None
+    if len(charuco_corners) == 0 or len(charuco_ids) == 0:
+        return None, None
+
+    # Ensure ids are Nx1 int32 (OpenCV expects this)
+    charuco_ids = np.asarray(charuco_ids, dtype=np.int32).reshape(-1, 1)
+    charuco_corners = np.asarray(charuco_corners, dtype=np.float32)
+
+    # Fix rare length mismatches (OpenCV 4.11 bug on some builds)
+    n = min(len(charuco_corners), len(charuco_ids))
+    if n < 4:
+        return None, None
+    if len(charuco_corners) != len(charuco_ids):
+        charuco_corners = charuco_corners[:n]
+        charuco_ids = charuco_ids[:n]
+
+    return charuco_corners, charuco_ids
+
+
+def estimate_charuco_pose(charuco_corners, charuco_ids, board, K, dist):
+    # Guard: make sure lengths match *again*
+    if (charuco_corners is None or charuco_ids is None or
+        len(charuco_corners) != len(charuco_ids) or len(charuco_ids) < 4):
+        return False, None, None
+
+    # Newer API
     try:
         retval, rvec, tvec = cv2.aruco.estimatePoseCharucoBoard(
             charuco_corners, charuco_ids, board, K, dist, None, None
         )
-        return bool(retval), rvec, tvec
+        valid = bool(retval) and rvec is not None and tvec is not None
+        return valid, rvec, tvec
     except Exception:
+        # Legacy return signature
         rvec, tvec = cv2.aruco.estimatePoseCharucoBoard(
             charuco_corners, charuco_ids, board, K, dist, None, None
         )
-        return (rvec is not None and tvec is not None), rvec, tvec
+        valid = (rvec is not None and tvec is not None)
+        return valid, rvec, tvec
+
 
 # ----------------- RealSense wrapper -----------------
 class RealSenseSource:
@@ -201,7 +242,7 @@ try:
 
             # Interpolate and pose (Board → Camera)
             charuco_corners, charuco_ids = interpolate_charuco(corners, ids, gray, board, K, dist)
-            if charuco_ids is not None and len(charuco_ids) >= 4:
+            if charuco_corners is not None:
                 valid, rvec, tvec = estimate_charuco_pose(charuco_corners, charuco_ids, board, K, dist)
                 if valid:
                     cv2.drawFrameAxes(frame, K, dist, rvec, tvec, AXIS_LEN_M)
