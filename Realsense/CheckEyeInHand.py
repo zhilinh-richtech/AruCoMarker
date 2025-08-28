@@ -22,16 +22,14 @@ TARGET_MARKER_ID  = 0                    # set an int (e.g., 23) if you want a s
 MARKER_LENGTH_M   = 0.072                   # 50 mm marker side length
 AXIS_LEN_M        = 0.08
 
-# ----------------- Eye-to-hand (Base ← Camera) -----------------
-data = np.load('../output/poses/result.npy', allow_pickle=True)
-#T_cam_base = data['T_cam2grip'].astype(np.float64)  # Base ← Camera
-# If you want to override with a fixed matrix, uncomment and edit:
-T_cam_base = np.array([
-    [-0.011733, -0.999899, -0.008041,  0.07153 ],
-    [ 0.999915, -0.011778,  0.005573,  0.011725],
-    [-0.005668, -0.007975,  0.999952, -0.131624],
-    [ 0.0,       0.0,       0.0,       1.0     ]
-])
+# ----------------- Eye-in-hand: load Camera → Gripper (Base ← EE via Gripper) -----------------
+try:
+    saved = np.load('../output/poses/result.npy', allow_pickle=True).item()
+    # This is Gripper ← Camera (used as the fixed hand-eye transform)
+    T_cam_base = saved['T_cam2grip'].astype(np.float64)
+    print("Loaded hand-eye transform from ../output/poses/result.npy")
+except Exception as e:
+    raise FileNotFoundError("Could not load ../output/poses/result.npy produced by EyeInHand.py") from e
 
 
 # ----------------- Connect xArm -----------------
