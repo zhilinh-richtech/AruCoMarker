@@ -2,6 +2,13 @@
 import numpy as np
 import cv2
 import pyrealsense2 as rs
+from utils import (
+    to_homogeneous,
+    invert_se3,
+    matrix_to_rpy,
+    rpy_to_matrix,
+    rot_angle_deg,
+)
 from xarm.wrapper import XArmAPI
 
 # ----------------- Config -----------------
@@ -66,47 +73,7 @@ def make_board_and_detector(dict_id=cv2.aruco.DICT_4X4_250):
 board, detector = make_board_and_detector(cv2.aruco.DICT_4X4_250)
 
 # ----------------- Helpers -----------------
-def to_homogeneous(R, t):
-    T = np.eye(4, dtype=np.float64)
-    T[:3,:3] = R
-    T[:3, 3] = t.reshape(3)
-    return T
-
-def invert_se3(T):
-    R = T[:3,:3]; t = T[:3,3]
-    RT = R.T
-    Ti = np.eye(4, dtype=np.float64)
-    Ti[:3,:3] = RT
-    Ti[:3, 3] = -RT @ t
-    return Ti
-
-def matrix_to_rpy(R):
-    sy = np.sqrt(R[0,0]**2 + R[1,0]**2)
-    singular = sy < 1e-6
-    if not singular:
-        roll  = np.arctan2(R[2,1], R[2,2])
-        pitch = np.arctan2(-R[2,0], sy)
-        yaw   = np.arctan2(R[1,0], R[0,0])
-    else:
-        roll  = np.arctan2(-R[1,2], R[1,1])
-        pitch = np.arctan2(-R[2,0], sy)
-        yaw   = 0.0
-    return np.degrees([roll, pitch, yaw])
-
-def rpy_to_matrix(roll, pitch, yaw):
-    # ZYX (yaw-pitch-roll), degrees input from xArm
-    roll  = np.radians(roll)
-    pitch = np.radians(pitch)
-    yaw   = np.radians(yaw)
-    Rx = np.array([[1,0,0],[0,np.cos(roll),-np.sin(roll)],[0,np.sin(roll),np.cos(roll)]], dtype=np.float64)
-    Ry = np.array([[np.cos(pitch),0,np.sin(pitch)],[0,1,0],[-np.sin(pitch),0,np.cos(pitch)]], dtype=np.float64)
-    Rz = np.array([[np.cos(yaw),-np.sin(yaw),0],[np.sin(yaw),np.cos(yaw),0],[0,0,1]], dtype=np.float64)
-    return Rz @ Ry @ Rx
-
-def rot_angle_deg(R):
-    v = (np.trace(R) - 1.0) / 2.0
-    v = np.clip(v, -1.0, 1.0)
-    return np.degrees(np.arccos(v))
+# Using shared utilities from utils.py
 
 # ----------------- Main loop -----------------
 try:

@@ -95,6 +95,9 @@ def invert_se3(T):
     return Ti
 
 def matrix_to_rpy(R):
+    # Accept 3x3 rotation matrix or 4x4 homogeneous matrix
+    if R.shape == (4, 4):
+        R = R[:3, :3]
     # ZYX (yaw-pitch-roll) -> returns (roll, pitch, yaw) in degrees
     sy = np.sqrt(R[0,0]**2 + R[1,0]**2)
     if sy >= 1e-6:
@@ -124,12 +127,27 @@ def rot_angle_deg(R):
 def wrap180(a):
     return (a + 180.0) % 360.0 - 180.0
 
-def choose_marker_index(corners, ids):
+def invert_rt(R, t):
+    Rt = R.T
+    return Rt, -Rt @ t
+
+def to_cv_lists(R_list, t_list):
+    Rcv = [np.asarray(R, dtype=np.float64) for R in R_list]
+    tcv = [np.asarray(t, dtype=np.float64).reshape(3, 1) for t in t_list]
+    return Rcv, tcv
+
+def rel_motion(R_a, t_a, R_b, t_b):
+    T_a = to_homogeneous(R_a, t_a)
+    T_b = to_homogeneous(R_b, t_b)
+    T_ab = T_b @ np.linalg.inv(T_a)
+    return T_ab[:3, :3], T_ab[:3, 3]
+
+def choose_marker_index(corners, ids, target_marker_id=None):
     """Pick a specific marker ID if provided; otherwise choose the largest-area marker."""
     if ids is None or len(ids) == 0:
         return None
-    if TARGET_MARKER_ID is not None:
-        matches = np.where(ids.flatten() == TARGET_MARKER_ID)[0]
+    if target_marker_id is not None:
+        matches = np.where(ids.flatten() == target_marker_id)[0]
         if len(matches) > 0:
             return int(matches[0])
         # fall through to largest if target not found

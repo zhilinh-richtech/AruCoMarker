@@ -7,6 +7,7 @@ from xarm.wrapper import XArmAPI
 # ...existing imports...
 import pyrealsense2 as rs
 import os
+from utils import rpy_to_matrix, rot_angle_deg, to_homogeneous, invert_rt, to_cv_lists, rel_motion
 
 # =========================
 # CONFIG
@@ -48,37 +49,16 @@ dist = calib["dist_coeffs"]
 # Utilities
 # =========================
 def euler_rpy_to_R(roll, pitch, yaw, degrees=True):
-    if degrees:
-        roll = np.deg2rad(roll); pitch = np.deg2rad(pitch); yaw = np.deg2rad(yaw)
-    cr, sr = np.cos(roll), np.sin(roll)
-    cp, sp = np.cos(pitch), np.sin(pitch)
-    cy, sy = np.cos(yaw), np.sin(yaw)
-    Rz = np.array([[cy,-sy,0],[sy,cy,0],[0,0,1]])
-    Ry = np.array([[cp,0,sp],[0,1,0],[-sp,0,cp]])
-    Rx = np.array([[1,0,0],[0,cr,-sr],[0,sr,cr]])
-    return Rz @ Ry @ Rx  # yaw-pitch-roll (ZYX)
+    # Delegate to shared utility. utils.rpy_to_matrix expects degrees.
+    if not degrees:
+        roll = np.degrees(roll); pitch = np.degrees(pitch); yaw = np.degrees(yaw)
+    return rpy_to_matrix(roll, pitch, yaw)
 
-def invert_rt(R, t):
-    Rt = R.T
-    return Rt, -Rt @ t
 
-def to_cv_lists(R_list, t_list):
-    Rcv = [np.asarray(R, dtype=np.float64) for R in R_list]
-    tcv = [np.asarray(t, dtype=np.float64).reshape(3,1) for t in t_list]
-    return Rcv, tcv
+# Use shared to_homogeneous from utils instead of local se3
 
-def se3(R, t):
-    T = np.eye(4); T[:3,:3] = R; T[:3,3] = t; return T
 
-def rot_angle_deg(R):
-    val = (np.trace(R) - 1.0) / 2.0
-    val = np.clip(val, -1.0, 1.0)
-    return np.degrees(np.arccos(val))
-
-def rel_motion(A1, t1, A2, t2):
-    T1 = se3(A1, t1); T2 = se3(A2, t2)
-    T12 = T2 @ np.linalg.inv(T1)
-    return T12[:3,:3], T12[:3,3]
+ 
 
 
 # =========================
@@ -298,13 +278,13 @@ def handeye_residuals(Rg, tg, Rt, tt, R_cam2base, t_cam2base):
     tt: target translations in camera frame
     R_cam2base, t_cam2base: camera to base transformation
     """
-    X = se3(R_cam2base, t_cam2base)
+    X = to_homogeneous(R_cam2base, t_cam2base)
     rots, trans = [], []
     for i in range(len(Rg) - 1):
         RA, tA = rel_motion(Rg[i], tg[i], Rg[i+1], tg[i+1])
         RB, tB = rel_motion(Rt[i+1], tt[i+1], Rt[i], tt[i])  # inverse order
-        L = se3(RA, tA) @ X
-        Rhs = X @ se3(RB, tB)
+        L = to_homogeneous(RA, tA) @ X
+        Rhs = X @ to_homogeneous(RB, tB)
         dR = L[:3,:3].T @ Rhs[:3,:3]
         dtheta = rot_angle_deg(dR)
         dt = np.linalg.norm(L[:3,3] - Rhs[:3,3])
