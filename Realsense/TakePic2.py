@@ -6,6 +6,7 @@ from xarm.wrapper import XArmAPI
 
 # ...existing imports...
 import pyrealsense2 as rs
+import os
 
 # =========================
 # CONFIG
@@ -21,7 +22,7 @@ REALSENSE_FPS = 30
 CHARUCO_SQUARES_X = 5       # columns (X across)
 CHARUCO_SQUARES_Y = 7       # rows    (Y down)
 SQUARE_LEN_M      = 0.034  # measure your printed square side (meters)
-MARKER_LEN_RATIO  = 0.78     # calib.io default unless you changed it
+MARKER_LEN_RATIO  = 0.81     # calib.io default unless you changed it
 MARKER_LEN_M      = MARKER_LEN_RATIO * SQUARE_LEN_M  # measure your printed marker side (meters)
 
 # If you KNOW these, set them; otherwise leave None to auto-lock from the image
@@ -35,7 +36,7 @@ MIN_SAMPLES      = 3
 TARGET_SAMPLES   = 20
 
 AXIS_LEN_M       = 0.08
-SAVE_NPY         = "handeye_result_stereo.npy"
+SAVE_DIR         = "../output/poses"  # Directory to save pose pairs
 
 # Load RealSense intrinsics/distortion from calibration file
 calib = np.load("../output/realsense_calibration.npz")
@@ -289,6 +290,14 @@ class XArmClient:
 # Residual diagnostics
 # =========================
 def handeye_residuals(Rg, tg, Rt, tt, R_cam2base, t_cam2base):
+    """
+    Calculate residuals for eye-in-hand hand-eye calibration.
+    Rg: gripper poses in base frame (camera poses in base frame)
+    tg: gripper translations in base frame
+    Rt: target poses in camera frame
+    tt: target translations in camera frame
+    R_cam2base, t_cam2base: camera to base transformation
+    """
     X = se3(R_cam2base, t_cam2base)
     rots, trans = [], []
     for i in range(len(Rg) - 1):
@@ -313,8 +322,8 @@ def handeye_residuals(Rg, tg, Rt, tt, R_cam2base, t_cam2base):
 # =========================
 def main():
     print("\n=== Instructions ===")
-    print("• Fix RealSense rigidly in the environment (eye-to-hand).")
-    print("• Mount ChArUco board rigidly on the gripper.")
+    print("• Mount RealSense rigidly on the gripper (eye-in-hand).")
+    print("• Fix ChArUco board rigidly in the environment.")
     print("• Move to varied poses (large rotations + translations).")
     print("• Press [SPACE] to capture, [q] to finish.\n")
 
@@ -325,8 +334,9 @@ def main():
     xarm = XArmClient(XARM_IP)
 
     ch_state = make_charuco_state()
-    R_g2b_list, t_g2b_list = [], []
-    R_t2c_list, t_t2c_list = [], []
+    R_g2b_list, t_g2b_list = [], []  # gripper to base (camera pose)
+    R_t2c_list, t_t2c_list = [], []  # target to camera
+    captured_images = []  # Store captured images for saving
 
     last_Rg, last_tg = None, None
 
@@ -364,22 +374,60 @@ def main():
                     print(f"⚠️  xArm read failed: {e}")
                     continue
 
-                R_gb, t_gb = invert_rt(R_bg, t_bg)
+                # In eye-in-hand: camera is on gripper, so gripper pose = camera pose
+                R_g2b = R_bg  # gripper to base (same as camera to base)
+                t_g2b = t_bg
 
                 accept = True
                 if last_Rg is not None:
-                    dR, dt = rel_motion(last_Rg, last_tg, R_gb, t_gb)
+                    dR, dt = rel_motion(last_Rg, last_tg, R_g2b, t_g2b)
                     ang = rot_angle_deg(dR); d = np.linalg.norm(dt)
                     if ang < MIN_ANGLE_DEG and d < MIN_TRANS_M:
                         print(f"Pose too similar (Δang={ang:.1f}°, Δt={d*1000:.1f} mm); move more.")
                         accept = False
 
                 if accept:
-                    R_g2b_list.append(R_gb); t_g2b_list.append(t_gb)
+                    R_g2b_list.append(R_g2b); t_g2b_list.append(t_g2b)
                     R, t = det
                     R_t2c_list.append(R); t_t2c_list.append(t)
-                    last_Rg, last_tg = R_gb, t_gb
-                    print(f"Captured #{len(R_g2b_list)}  (markers:{ch_state['last_markers']}, charuco:{ch_state['last_charuco']})")
+                    captured_images.append(color.copy())  # Store the captured image
+                    last_Rg, last_tg = R_g2b, t_g2b
+                    
+                    # Save pose pair immediately
+                    pose_num = len(R_g2b_list)
+                    
+                    # Create directory if it doesn't exist
+                    os.makedirs(SAVE_DIR, exist_ok=True)
+                    
+                    # Convert rotation matrices to Euler angles for saving
+                    R_g2b_euler = cv2.Rodrigues(R_g2b)[0]
+                    R_t2c_euler = cv2.Rodrigues(R)[0]  # Use R from det
+                    
+                    # Calculate base to gripper transformation (inverse of gripper to base)
+                    R_base2gripper, t_base2gripper = invert_rt(R_g2b, t_g2b)
+                    
+                    # Save as JPG
+                    img_name = f"{SAVE_DIR}/pose{pose_num:03d}.jpg"
+                    cv2.imwrite(img_name, captured_images[-1])
+                    
+                    # Save as NPY with base to gripper transformation
+                    np.save(f"{SAVE_DIR}/pose{pose_num:03d}.npy", {
+                        "R_base2gripper": R_base2gripper,      # Base to gripper rotation
+                        "t_base2gripper": t_base2gripper,      # Base to gripper translation
+                        "R_gripper2base": R_g2b,               # Original gripper to base (for reference)
+                        "t_gripper2base": t_g2b,               # Original gripper to base (for reference)
+                        "R_target2cam": R,                      # Target to camera (from det)
+                        "t_target2cam": t,                      # Target to camera (from det)
+                        "R_base2gripper_euler": cv2.Rodrigues(R_base2gripper)[0],  # Base to gripper in Euler angles
+                        "R_target2cam_euler": R_t2c_euler,                         # Target to camera in Euler angles
+                        "pose_number": pose_num,
+                        "timestamp": pose_num  # You could add actual timestamp here if needed
+                    }, allow_pickle=True)
+                    
+                    
+                    print(f"Captured #{pose_num}  (markers:{ch_state['last_markers']}, charuco:{ch_state['last_charuco']})")
+                    print(f"Saved → {img_name}")
+                    print(f"Saved → {SAVE_DIR}/pose{pose_num:03d}.npy")
     finally:
         cv2.destroyAllWindows()
         rs_cam.close()
@@ -392,20 +440,66 @@ def main():
 
     Rg, tg = to_cv_lists(R_g2b_list, t_g2b_list)
     Rt, tt = to_cv_lists(R_t2c_list, t_t2c_list)
-    print("\nRunning hand-eye (Park)...")
+    print("\nRunning hand-eye calibration (eye-in-hand)...")
     R_cam2base, t_cam2base = cv2.calibrateHandEye(
-        R_gripper2base=Rg, t_gripper2base=tg,
-        R_target2cam=Rt,  t_target2cam=tt,
+        R_gripper2base=Rg, t_gripper2base=tg,  # Camera poses in base frame
+        R_target2cam=Rt,  t_target2cam=tt,     # Target poses in camera frame
         method=cv2.CALIB_HAND_EYE_PARK
     )
     t_cam2base = t_cam2base.reshape(3)
-    T_base_cam = np.eye(4); T_base_cam[:3,:3]=R_cam2base; T_base_cam[:3,3]=t_cam2base
+
+    # For eye-in-hand: camera is mounted on gripper
+    # We want the transformation from camera frame to gripper frame
+    # This is the fixed offset between camera and gripper TCP
+    # We can calculate this from the calibration results
+    
+    # Since we have gripper poses in base frame and camera poses in base frame,
+    # we can find the camera-to-gripper transformation
+    # T_gripper2base = T_cam2base * T_gripper2cam
+    # Therefore: T_gripper2cam = inv(T_cam2base) * T_gripper2base
+    # And: T_cam2gripper = inv(T_gripper2cam)
+    
+    # For now, let's use the first pose to calculate this relationship
+    if len(R_g2b_list) > 0:
+        R_gripper2base = R_g2b_list[0]  # First gripper pose
+        t_gripper2base = t_g2b_list[0]
+        
+        # T_gripper2base = T_cam2base * T_gripper2cam
+        # T_gripper2cam = inv(T_cam2base) * T_gripper2base
+        T_cam2base_4x4 = np.eye(4)
+        T_cam2base_4x4[:3,:3] = R_cam2base
+        T_cam2base_4x4[:3,3] = t_cam2base
+        
+        T_gripper2base_4x4 = np.eye(4)
+        T_gripper2base_4x4[:3,:3] = R_gripper2base
+        T_gripper2base_4x4[:3,3] = t_gripper2base
+        
+        # T_gripper2cam = inv(T_cam2base) * T_gripper2base
+        T_gripper2cam = np.linalg.inv(T_cam2base_4x4) @ T_gripper2base_4x4
+        
+        # T_cam2gripper = inv(T_gripper2cam)
+        T_cam2gripper = np.linalg.inv(T_gripper2cam)
+        
+        R_cam2gripper = T_cam2gripper[:3,:3]
+        t_cam2gripper = T_cam2gripper[:3,3]
+    else:
+        # Fallback if no poses captured
+        R_cam2gripper = np.eye(3)
+        t_cam2gripper = np.zeros(3)
+        T_cam2gripper = np.eye(4)
 
     np.set_printoptions(precision=6, suppress=True)
-    print("\n=== T_base_cam (camera pose in base frame) ===")
-    print(T_base_cam)
+    print("\n=== T_cam2gripper (camera to gripper transformation) ===")
+    print(T_cam2base_4x4)
+    print("\n=== t_cam2gripper (translation vector) ===")
+    print(t_cam2base)
+    np.save(f"{SAVE_DIR}/result.npy", {
+        "t_cam2grip": t_cam2base,
+        "R_cam2grip": R_cam2base,
+        "T_cam2grip": T_cam2base_4x4
+    }, allow_pickle=True)
     np.savez("../output/markercalibration.npz",
-    last_mark = T_base_cam)
+    last_mark = T_cam2gripper)
 
     res = handeye_residuals(Rg, tg, Rt, tt, R_cam2base, t_cam2base)
     if res:
@@ -413,24 +507,10 @@ def main():
               f"rot mean={res['rot_deg']['mean']:.3f}°, med={res['rot_deg']['median']:.3f}°, p95={res['rot_deg']['p95']:.3f}°; "
               f"trans mean={res['trans_m']['mean']:.4f} m, med={res['trans_m']['median']:.4f} m, p95={res['trans_m']['p95']:.4f} m")
 
-    # Detailed validation is handled in MoveArm3.py
-
-    np.save(SAVE_NPY, {
-        "resolution": (REALSENSE_WIDTH, REALSENSE_HEIGHT),
-        "charuco": {
-            "squares_xy": (CHARUCO_SQUARES_X, CHARUCO_SQUARES_Y),
-            "square_len_m": SQUARE_LEN_M,
-            "marker_len_m": MARKER_LEN_M,
-            "dict_id": int(ARUCO_DICT_ID) if ARUCO_DICT_ID is not None else (int(ch_state['dict_id']) if ch_state['dict_id'] is not None else None),
-            "first_marker_id": int(FIRST_MARKER_ID) if FIRST_MARKER_ID is not None else (int(ch_state['first_off']) if ch_state['first_off'] is not None else None),
-        },
-        "K": K, "dist": dist,
-        "R_base_cam": R_cam2base, "t_base_cam": t_cam2base,
-        "T_base_cam": T_base_cam,
-        "residuals": res,
-        "captures": len(R_g2b_list)
-    }, allow_pickle=True)
-    print(f"\nSaved → {SAVE_NPY}")
+    print(f"\n=== Eye-in-hand calibration complete ===")
+    print(f"Total poses captured: {len(R_g2b_list)}")
+    print(f"Pose pairs saved to: {SAVE_DIR}")
+    print(f"Calibration result saved to: ../output/markercalibration.npz")
 
 if __name__ == "__main__":
     main()

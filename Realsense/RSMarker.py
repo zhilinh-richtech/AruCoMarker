@@ -10,24 +10,24 @@ XARM_IP = '192.168.10.201'
 # ---- ArUco marker parameters ----
 ARUCO_DICT_ID     = cv2.aruco.DICT_4X4_250  # change if your tag uses a different family
 TARGET_MARKER_ID  = 0                    # set an int (e.g., 23) if you want a specific ID
-MARKER_LENGTH_M   = 0.108                   # 50 mm marker side length
+MARKER_LENGTH_M   = 0.072                   # 50 mm marker side length
 AXIS_LEN_M        = 0.08
 
 # ----------------- Eye-to-hand (Base ← Camera) -----------------
-data = np.load('../output/markercalibration.npz')
-T_cam_base = data['last_mark'].astype(np.float64)  # Base ← Camera
+data = np.load('../output/poses/result.npy', allow_pickle=True)
+#T_cam_base = data['T_cam2grip'].astype(np.float64)  # Base ← Camera
 # If you want to override with a fixed matrix, uncomment and edit:
-# T_cam_base = np.array([
-#     [-0.982374, -0.084552, -0.166708,  0.573300],
-#     [ 0.186508, -0.383933, -0.904328,  0.506070],
-#     [ 0.012458, -0.919481,  0.392936,  0.139193],
-#     [ 0.000000,  0.000000,  0.000000,  1.000000]
-# ])
+T_cam_base = np.array([
+    [0.51097,  -0.559244,  0.652806, -1.189456],
+    [0.742469, -0.095573, -0.663027, -1.593206],
+    [0.433185,  0.823476,  0.366386,  0.600184],
+    [0.0,       0.0,       0.0,       1.0]
+])
 
 
 # ----------------- Connect xArm -----------------
 arm = XArmAPI(XARM_IP)
-arm.motion_enable(True)
+# arm.motion_enable(True)
 
 # ----------------- Camera intrinsics -----------------
 with np.load("../output/realsense_calibration.npz") as data_cal:
@@ -150,7 +150,16 @@ aruco_params = cv2.aruco.DetectorParameters()
 # aruco_params.minMarkerPerimeterRate = 0.03
 # aruco_params.maxMarkerPerimeterRate = 4.0
 detector = cv2.aruco.ArucoDetector(aruco_dict, aruco_params)
-
+def euler_rpy_to_R(roll, pitch, yaw, degrees=True):
+    if degrees:
+        roll = np.deg2rad(roll); pitch = np.deg2rad(pitch); yaw = np.deg2rad(yaw)
+    cr, sr = np.cos(roll), np.sin(roll)
+    cp, sp = np.cos(pitch), np.sin(pitch)
+    cy, sy = np.cos(yaw), np.sin(yaw)
+    Rz = np.array([[cy,-sy,0],[sy,cy,0],[0,0,1]])
+    Ry = np.array([[cp,0,sp],[0,1,0],[-sp,0,cp]])
+    Rx = np.array([[1,0,0],[0,cr,-sr],[0,sr,cr]])
+    return Rz @ Ry @ Rx  # yaw-pitch-roll (ZYX)
 # ----------------- Main loop -----------------
 try:
     while True:
@@ -172,11 +181,14 @@ try:
                 )
                 rvec = rvecs[idx].reshape(3)
                 tvec = tvecs[idx].reshape(3)
-                # code, pose = arm.get_position()  # degrees\
-               
+                code, pose = arm.get_position(is_radian = False)  # degrees\
+                x, y, z, roll, pitch, yaw = pose
+                t_gb = np.array([x, y, z], dtype=np.float64) / 1000.0  # mm -> m
+                R_gb = euler_rpy_to_R(roll, pitch, yaw, degrees=True)
+                GripperTBase = to_homogeneous(R_gb, t_gb)
                 R_cm, _ = cv2.Rodrigues(rvec)                   # Camera ← Marker rotation
                 T_C_from_M = to_homogeneous(R_cm, tvec)         # Camera ← Marker
-                T_B_from_M = T_cam_base @ T_C_from_M            # Base ← Marker
+                T_B_from_M = GripperTBase@  T_cam_base @ T_C_from_M            # Base ← Marker
 
                 # Draw axes on the chosen tag
                 cv2.aruco.drawDetectedMarkers(frame, [corners[idx]], ids[idx:idx+1])
@@ -190,7 +202,7 @@ try:
                     t_gripper_base = np.array(pose[:3], dtype=np.float64) / 1000.0  # mm → m
                     R_gripper_base = rpy_to_matrix(pose[3], pose[4], pose[5])
                     T_base_gripper = to_homogeneous(R_gripper_base, t_gripper_base) 
-                    # x, y, z, roll, pitch, yaw = pose
+                    # x, y, z, roll,DetectorParameterspitch, yaw = pose
                     # t_B_from_G = np.array([x, y, z], dtype=np.float64) / 1000.0
                     # R_B_from_G = rpy_to_matrix(roll, pitch, yaw)
                     # T_B_from_G = to_homogeneous(R_B_from_G, t_B_from_G)
