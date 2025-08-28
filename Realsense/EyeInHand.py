@@ -5,18 +5,17 @@ from xarm.wrapper import XArmAPI
 import os
 import sys
 from typing import Tuple
-
+import pyrealsense2 as rs
 # ----------------- Config -----------------
-XARM_IP = '192.168.2.112'
-CAM_INDEX = 10
-FRAME_SIZE = (1280, 720)
-FPS = 30
-
+XARM_IP = '192.168.10.201'
+REALSENSE_WIDTH = 1280
+REALSENSE_HEIGHT = 800
+REALSENSE_FPS = 30
 # Your Charuco board (update if different!)
 ARUCO_DICT_ID = cv2.aruco.DICT_4X4_250
 CHARUCO_SQUARES_X = 5
 CHARUCO_SQUARES_Y = 7
-CHARUCO_SQUARE_LEN_M = 0.02474
+CHARUCO_SQUARE_LEN_M = 0.034
 CHARUCO_MARKER_LEN_M = 0.78 * CHARUCO_SQUARE_LEN_M  # default from calib.io unless you changed it
 
 AXIS_LEN_M = 0.05  # draw axis length for visualization
@@ -97,23 +96,41 @@ arm = XArmAPI(XARM_IP)
 arm.motion_enable(True)
 
 # ----------------- Load camera intrinsics -----------------
-calib_path = os.path.join(save_dir, "charuco_calibration.npz")
-if not os.path.exists(calib_path):
-    print(f"❌ Missing intrinsics: {calib_path}")
-    sys.exit(1)
+# calib_path = os.path.join(save_dir, "charuco_calibration.npz")
+calib_path = "../output/realsense_calibration.npz"
+# if not os.path.exists(calib_path):
+#     print(f"❌ Missing intrinsics: {calib_path}")
+#     sys.exit(1)
 
 with np.load(calib_path) as data:
     camera_matrix = data["camera_matrix"].astype(np.float64)
     dist_coeffs = data["dist_coeffs"].astype(np.float64)
 
 # ----------------- Camera -----------------
-cap = cv2.VideoCapture(CAM_INDEX)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_SIZE[0])
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_SIZE[1])
-cap.set(cv2.CAP_PROP_FPS, FPS)
-if not cap.isOpened():
-    print("❌ Failed to open camera")
-    sys.exit(1)
+class RealSenseSource:
+    def __init__(self, width=1280, height=800, fps=30):
+        self.pipeline = rs.pipeline()
+        config = rs.config()
+        config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
+        self.pipeline.start(config)
+
+    def read(self):
+        frames = self.pipeline.wait_for_frames()
+        color_frame = frames.get_color_frame()
+        if not color_frame:
+            return False, None
+        color_image = np.asanyarray(color_frame.get_data())
+        return True, color_image
+
+    def close(self):
+        self.pipeline.stop()
+# cap = cv2.VideoCapture(CAM_INDEX)
+# cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_SIZE[0])
+# cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_SIZE[1])
+# cap.set(cv2.CAP_PROP_FPS, FPS)
+# if not cap.isOpened():
+#     print("❌ Failed to open camera")
+#     sys.exit(1)
 
 # ----------------- ArUco/Charuco setup -----------------
 aruco_dict = cv2.aruco.getPredefinedDictionary(ARUCO_DICT_ID)
@@ -146,9 +163,11 @@ print("[INFO] Move robot to varied poses. Press 's' to save a sample, 'q' to cal
 last_valid = {"rvec": None, "tvec": None, "have_pose": False}
 
 while True:
-    ok, frame = cap.read()
-    if not ok:
-        continue
+    rs_cam = RealSenseSource(REALSENSE_WIDTH, REALSENSE_HEIGHT, REALSENSE_FPS)
+    ok, frame = rs_cam.read()
+    if not ok or frame is None:
+                print("Camera read failed")
+                break
 
     # Detect markers (API split: new detector vs legacy)
     if detector is not None:
