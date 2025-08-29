@@ -15,6 +15,15 @@ from utils import (
     to_cv_lists,
     rel_motion,
 )
+from terminal_display import Display, draw_axes_ascii_friendly
+import argparse
+import sys
+import time
+import shutil
+import select
+import termios
+import tty
+import os
 
 # =========================
 # CONFIG
@@ -76,6 +85,10 @@ class RealSenseSource:
     def close(self):
         self.cam.close()
 
+
+# =========================
+# Terminal/ASCII helpers moved to terminal_display.Display
+# =========================
 
 # =========================
 # ChArUco with auto dict + firstMarkerId lock-in (no board mutation)
@@ -287,14 +300,25 @@ def handeye_residuals(Rg, tg, Rt, tt, R_cam2base, t_cam2base):
 # Main
 # =========================
 def main():
+    parser = argparse.ArgumentParser(description="Eye-to-Hand hand-eye calibration (terminal-friendly)")
+    parser.add_argument("--mode", choices=["gui", "ascii", "ascii_hi", "headless"],
+                        default=("gui" if os.environ.get("DISPLAY") else "ascii"),
+                        help="Display mode: OpenCV GUI, ASCII in terminal, or headless")
+    parser.add_argument("--camera", choices=["auto", "realsense", "opencv"], default="auto",
+                        help="Camera backend to use: RealSense (if available) or OpenCV UVC")
+    args = parser.parse_args()
+
     print("\n=== Instructions ===")
     print("• Fix RealSense rigidly in the environment (eye-to-hand).")
     print("• Mount ChArUco board rigidly on the gripper.")
     print("• Move to varied poses (large rotations + translations).")
-    print("• Press [SPACE] to capture, [q] to finish.\n")
+    if args.mode == "gui":
+        print("• Press [SPACE] to capture, [q] to finish in the GUI window.\n")
+    else:
+        print("• In terminal, press SPACE to capture, q to finish.\n")
 
-    print("Opening RealSense...")
-    rs_cam = RealSenseSource(REALSENSE_WIDTH, REALSENSE_HEIGHT, REALSENSE_FPS, camera_kind="auto")
+    print("Opening camera...")
+    rs_cam = RealSenseSource(REALSENSE_WIDTH, REALSENSE_HEIGHT, REALSENSE_FPS, camera_kind=args.camera)
 
     print("Connecting xArm...")
     xarm = XArmClient(XARM_IP)
@@ -305,6 +329,7 @@ def main():
 
     last_Rg, last_tg = None, None
 
+    display = Display(args.mode)
     try:
         while True:
             ok, color = rs_cam.read()
@@ -317,7 +342,10 @@ def main():
 
             if det is not None:
                 R, t = det
-                cv2.drawFrameAxes(vis, K, dist, cv2.Rodrigues(R)[0], t.reshape(3,1), AXIS_LEN_M)
+                if args.mode in ("ascii", "ascii_hi", "headless"):
+                    draw_axes_ascii_friendly(vis, K, dist, R, t, AXIS_LEN_M, thickness=6)
+                else:
+                    cv2.drawFrameAxes(vis, K, dist, cv2.Rodrigues(R)[0], t.reshape(3,1), AXIS_LEN_M)
                 cv2.putText(vis, "Board detected", (20,30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,255,0), 2)
             else:
                 cv2.putText(vis, "No board", (20,30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,0,255), 2)
@@ -325,11 +353,12 @@ def main():
             cap_txt = f"Captures: {len(R_g2b_list)} / {TARGET_SAMPLES}"
             cv2.putText(vis, cap_txt, (20,60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
 
-            cv2.imshow("RealSense", vis)
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
+            status = f"Captures: {len(R_g2b_list)}/{TARGET_SAMPLES}  |  {'Board detected' if det is not None else 'No board'}  |  [SPACE]=capture, q=quit"
+            key = display.update(vis, status)
+
+            if key == 'q':
                 break
-            if key == ord(' '):
+            if key == ' ':
                 if det is None:
                     print("⚠️  Need the board detected. Adjust and try again.")
                     continue
@@ -356,7 +385,7 @@ def main():
                     last_Rg, last_tg = R_gb, t_gb
                     print(f"Captured #{len(R_g2b_list)}  (markers:{ch_state['last_markers']}, charuco:{ch_state['last_charuco']})")
     finally:
-        cv2.destroyAllWindows()
+        display.close()
         rs_cam.close()
         xarm.close()
 
