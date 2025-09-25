@@ -1,39 +1,38 @@
 #!/usr/bin/env python3
-import argparse
-import os
-import select
-import shutil
-import sys
-import termios
-import time
-import tty
-
 import cv2
 import numpy as np
+from xarm.wrapper import XArmAPI
+import os
+import argparse
+import sys
+import time
+import shutil
+import select
+import termios
+import tty
 from scipy.spatial.transform import Rotation as R
 
+# Import from Realsense directory
+sys.path.append('../Realsense')
+from utils import rpy_to_matrix, rot_angle_deg, to_homogeneous, invert_rt, to_cv_lists, rel_motion
 from camera import create_camera
-import pyrealsense2 as rs
 from terminal_display import Display, draw_axes_ascii_friendly
-from utils import (
-    invert_rt,
-    rel_motion,
-    rot_angle_deg,
-    rpy_to_matrix,
-    to_cv_lists,
-    to_homogeneous,
-)
-from xarm.wrapper import XArmAPI
 
 # =========================
 # CONFIG
 # =========================
-XARM_IP = "192.168.10.22"
+XARM_IP = "192.168.10.202"
 USE_DEG = True
 
-REALSENSE_WIDTH = 1280
-REALSENSE_HEIGHT = 800
-REALSENSE_FPS = 30
+# Performance settings
+FAST_MODE = False  # Set to False for high accuracy (slower)
+ULTRA_FAST_MODE = False  # Even more aggressive optimizations
+SKIP_UNDISTORTION = False  # Skip image undistortion for speed
+
+# Orbbec camera settings (1920x1080 is typical for Orbbec)
+ORBBEC_WIDTH = 1920
+ORBBEC_HEIGHT = 1080
+ORBBEC_FPS = 30
 
 # calib.io ChArUco board (you said: rows=4, columns=6)
 CHARUCO_SQUARES_X = 5       # columns (X across)
@@ -53,14 +52,22 @@ MIN_SAMPLES      = 3
 TARGET_SAMPLES   = 20
 
 AXIS_LEN_M       = 0.08
-SAVE_DIR         = "../output/poses"  # Directory to save pose pairs
+SAVE_DIR         = "../output/poses_orbbec"  # Directory to save pose pairs
 
-# Load RealSense intrinsics/distortion from calibration file
-calib = np.load("../output/realsense_calibration.npz")
-K = calib["camera_matrix"]
-dist = calib["dist_coeffs"]
-print(K)
-print(dist)
+# Load Orbbec intrinsics/distortion from calibration file
+# You'll need to create this file using OrbbecIntrinsics.py first
+try:
+    calib = np.load("../output/orbbec_calibration.npz")
+    K = calib["camera_matrix"]
+    dist = calib["dist_coeffs"]
+    print("✓ Loaded Orbbec calibration:")
+    print(K)
+    print(dist)
+except FileNotFoundError:
+    print("❌ Orbbec calibration file not found!")
+    print("Please run OrbbecIntrinsics.py first to generate ../output/orbbec_calibration.npz")
+    print("Or create a calibration file with 'camera_matrix' and 'dist_coeffs' keys")
+    sys.exit(1)
 
 # =========================
 # Kalman Filter for 6-DoF Pose
@@ -146,18 +153,11 @@ def euler_rpy_to_R(roll, pitch, yaw, degrees=True):
         roll = np.degrees(roll); pitch = np.degrees(pitch); yaw = np.degrees(yaw)
     return rpy_to_matrix(roll, pitch, yaw)
 
-
-# Use shared to_homogeneous from utils instead of local se3
-
-
- 
-
-
 # =========================
-# RealSense source
+# Orbbec source
 # =========================
-class RealSenseSource:
-    def __init__(self, width=1280, height=800, fps=30, camera_kind: str = "auto"):
+class OrbbecSource:
+    def __init__(self, width=1920, height=1080, fps=30, camera_kind: str = "orbbec"):
         self.cam = create_camera(kind=camera_kind, width=width, height=height, fps=fps)
 
     def read(self):
@@ -165,11 +165,6 @@ class RealSenseSource:
 
     def close(self):
         self.cam.close()
-
-
-# =========================
-# Terminal/ASCII helpers moved to terminal_display.Display
-# =========================
 
 # =========================
 # ChArUco with auto dict + firstMarkerId lock-in (no board mutation)
@@ -186,28 +181,44 @@ def _dict_size(dict_id):
 def _make_board_and_detector(dict_id):
     aruco_dict = cv2.aruco.getPredefinedDictionary(dict_id)
     params = cv2.aruco.DetectorParameters()
-    # Robust-ish defaults; good for prints/screens
-    params.adaptiveThreshWinSizeMin = 5
-    params.adaptiveThreshWinSizeMax = 75
-    params.adaptiveThreshWinSizeStep = 1
-      # Allow slightly larger   
-    params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
-    params.cornerRefinementWinSize = 20       # Larger refinement window
-    params.cornerRefinementMaxIterations = 100 # More iterations
-    params.cornerRefinementMinAccuracy = 0.01 
-    params.detectInvertedMarker = True
-    params.minMarkerPerimeterRate = 0.005      # Allow smaller markers
-    params.maxMarkerPerimeterRate = 6.0 
-    params.adaptiveThreshConstant = 3     
-    params.minCornerDistanceRate = 0.003  
-    params.markerBorderBits = 1  
-    params.useAruco3Detection = True
+    
+    if ULTRA_FAST_MODE:
+        # Ultra-fast settings - minimal processing
+        params.adaptiveThreshWinSizeMin = 3
+        params.adaptiveThreshWinSizeMax = 23
+        params.adaptiveThreshWinSizeStep = 2
+        params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_NONE  # No refinement
+        params.detectInvertedMarker = False  # Skip inverted detection
+        params.minMarkerPerimeterRate = 0.01
+        params.maxMarkerPerimeterRate = 4.0
+        params.adaptiveThreshConstant = 7
+        params.minCornerDistanceRate = 0.005
+        params.markerBorderBits = 1
+        params.useAruco3Detection = False  # Disable Aruco3 for speed
+    else:
+        # Robust-ish defaults; good for prints/screens
+        params.adaptiveThreshWinSizeMin = 5
+        params.adaptiveThreshWinSizeMax = 75
+        params.adaptiveThreshWinSizeStep = 1
+        params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+        params.cornerRefinementWinSize = 20       # Larger refinement window
+        params.cornerRefinementMaxIterations = 100 # More iterations
+        params.cornerRefinementMinAccuracy = 0.01 
+        params.detectInvertedMarker = True
+        params.minMarkerPerimeterRate = 0.005      # Allow smaller markers
+        params.maxMarkerPerimeterRate = 6.0 
+        params.adaptiveThreshConstant = 3     
+        params.minCornerDistanceRate = 0.003  
+        params.markerBorderBits = 1  
+        params.useAruco3Detection = True
 
-    detector = cv2.aruco.ArucoDetector(aruco_dict, params)
+    aruco_detector = cv2.aruco.ArucoDetector(aruco_dict, params)
     board = cv2.aruco.CharucoBoard(
         (CHARUCO_SQUARES_X, CHARUCO_SQUARES_Y),
         SQUARE_LEN_M, MARKER_LEN_M, aruco_dict
     )
+    detector = cv2.aruco.CharucoDetector(board)
+    detector.setDetectorParameters(aruco_detector.getDetectorParameters())
     return board, detector
 
 _COMMON_DICTS = [
@@ -252,9 +263,67 @@ def estimate_charuco_pose(undistorted_img, K, dist, debug_img=None, state=None):
     """
     assert state is not None
 
-    def draw_counts(img, markers, charuco):
-        cv2.putText(img, f"markers:{markers}", (20,100), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,0), 2)
-        cv2.putText(img, f"charuco:{charuco}", (20,130), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,255), 2)
+def draw_counts(img, markers, charuco):
+    cv2.putText(img, f"markers:{markers}", (20,100), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,0), 2)
+    cv2.putText(img, f"charuco:{charuco}", (20,130), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,255), 2)
+
+def draw_bounding_boxes(img, charuco_corners, charuco_ids, marker_corners=None, marker_ids=None):
+    """Draw bounding boxes around detected ChArUco corners and markers"""
+    try:
+        # # Draw bounding boxes around ChArUco corners
+        # if charuco_corners is not None and charuco_ids is not None and len(charuco_corners) > 0:
+        #     for i, corner in enumerate(charuco_corners):
+        #         # ChArUco corners are individual points, not 4-point polygons
+        #         if len(corner.shape) == 2 and corner.shape[1] == 2:  # Shape (1, 2) for single corner
+        #             x, y = int(corner[0, 0]), int(corner[0, 1])
+        #             # Draw a medium-sized box around the corner point
+        #             box_size = 15  # Medium-sized box for visibility
+        #             x_min, x_max = x - box_size, x + box_size
+        #             y_min, y_max = y - box_size, y + box_size
+                    
+        #             # Draw bounding box in cyan with thin lines
+        #             cv2.rectangle(img, (x_min, y_min), (x_max, y_max), (255, 255, 0), 1)  # Thin line
+                    
+        #             # Add corner ID label with smaller font
+        #             if i < len(charuco_ids):
+        #                 cv2.putText(img, f"Ch{charuco_ids[i]}", (x_min, y_min-5), 
+        #                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)  # Medium font
+        
+        # Draw bounding boxes around individual markers
+        if marker_corners is not None and marker_ids is not None and len(marker_corners) > 0:
+            for i, corners in enumerate(marker_corners):
+                # ArUco marker corners have shape (1, 4, 2)
+                if len(corners.shape) == 3 and corners.shape[1] == 4:
+                    # Get bounding rectangle for this marker
+                    x_coords = corners[0][:, 0]
+                    y_coords = corners[0][:, 1]
+                    x_min, x_max = int(np.min(x_coords)), int(np.max(x_coords))
+                    y_min, y_max = int(np.min(y_coords)), int(np.max(y_coords))
+                    
+                    # Expand the bounding box for better visibility
+                    margin = 10
+                    x_min, x_max = x_min - margin, x_max + margin
+                    y_min, y_max = y_min - margin, y_max + margin
+                    
+                    # Draw bounding box in green with thin lines
+                    cv2.rectangle(img, (x_min, y_min), (x_max, y_max), (0, 255, 0), 1)  # Thin line
+                    
+                    # Add marker ID label with smaller font
+                    if i < len(marker_ids):
+                        cv2.putText(img, f"M{marker_ids[i][0]}", (x_min, y_min-5), 
+                                  cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)  # Medium font
+    except Exception as e:
+        print(f"Error in draw_bounding_boxes: {e}")
+        import traceback
+        traceback.print_exc()
+
+def estimate_charuco_pose(undistorted_img, K, dist, debug_img=None, state=None):
+    """
+    Auto-lock dictionary and firstMarkerId from observed IDs.
+    Returns (R, t) or None. Updates state['last_markers'], state['last_charuco'].
+    Note: undistorted_img should be the undistorted image for accurate detection.
+    """
+    assert state is not None
 
     if not state['locked']:
         # try each common dict
@@ -263,131 +332,117 @@ def estimate_charuco_pose(undistorted_img, K, dist, debug_img=None, state=None):
                 state['candidates'][did] = _make_board_and_detector(did)
             board, det = state['candidates'][did]
 
-            corners, ids, _ = det.detectMarkers(undistorted_img)
-            state['last_markers'] = 0 if ids is None else int(len(ids))
+            # Use the new CharucoDetector API
+            charuco_corners, charuco_ids, marker_corners, marker_ids = det.detectBoard(undistorted_img)
+            state['last_charuco'] = 0 if charuco_ids is None else int(len(charuco_ids))
+            state['last_markers'] = 0 if marker_ids is None else int(len(marker_ids))
             
-            # Apply subpixel refinement to marker corners
-            if corners is not None and len(corners) > 0:
-                gray_img = cv2.cvtColor(undistorted_img, cv2.COLOR_BGR2GRAY)
-                refined_corners = []
-                for i in range(len(corners)):
-                    refined_corner = cv2.cornerSubPix(gray_img, corners[i], (7, 7), (-1, -1), 
-                                                    (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 0.001))
-                    refined_corners.append(refined_corner)
-                corners = refined_corners
-            
-            if debug_img is not None and ids is not None and len(ids) > 0:
-                cv2.aruco.drawDetectedMarkers(debug_img, corners, ids)
+            if debug_img is not None and charuco_ids is not None and len(charuco_ids) > 0:
+                cv2.aruco.drawDetectedCornersCharuco(debug_img, charuco_corners, charuco_ids)
+                # Draw bounding boxes around detected elements
+                draw_bounding_boxes(debug_img, charuco_corners, charuco_ids, marker_corners, marker_ids)
 
-            if ids is None or len(ids) < 4:
+            if charuco_ids is None or len(charuco_ids) < 10:
                 if debug_img is not None:
-                    draw_counts(debug_img, state['last_markers'], 0)
+                    draw_counts(debug_img, 0, state['last_charuco'])
                 continue
 
-            dict_sz = _dict_size(did)
-            guess_off = int(np.min(ids)) if FIRST_MARKER_ID is None else int(FIRST_MARKER_ID)
-            ids_adj = _adjust_ids(ids, guess_off, dict_sz)
-
-            retval, ch_corners, ch_ids = cv2.aruco.interpolateCornersCharuco(corners, ids_adj, undistorted_img, board)
-            state['last_charuco'] = 0 if (retval is None) else int(retval)
-            if retval is None or retval < 10:
-                if debug_img is not None:
-                    draw_counts(debug_img, state['last_markers'], state['last_charuco'])
-                continue
-
-            # Additional subpixel refinement for ChArUco corners
-            if ch_corners is not None and len(ch_corners) > 0:
+            # Apply subpixel refinement based on mode
+            if charuco_corners is not None and len(charuco_corners) > 0 and not FAST_MODE:
                 # Convert to float32 for subpixel refinement
-                ch_corners_float = np.array(ch_corners, dtype=np.float32)
+                ch_corners_float = np.array(charuco_corners, dtype=np.float32)
                 # Convert BGR to grayscale for subpixel refinement
                 gray_img = cv2.cvtColor(undistorted_img, cv2.COLOR_BGR2GRAY)
                 # Apply subpixel corner refinement
                 cv2.cornerSubPix(gray_img, ch_corners_float, (5, 5), (-1, -1), 
                                 (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.1))
-                ch_corners = ch_corners_float
+                charuco_corners = ch_corners_float
 
-            ok, rvec, tvec = cv2.aruco.estimatePoseCharucoBoard(ch_corners, ch_ids, board, K, dist, None, None)
+            # Use solvePnP directly with board object points
+            obj_points = board.getChessboardCorners()
+            ok, rvec, tvec = cv2.solvePnP(obj_points[charuco_ids.flatten()], charuco_corners, K, dist)
             if not ok:
                 if debug_img is not None:
                     draw_counts(debug_img, state['last_markers'], state['last_charuco'])
                 continue
 
-            # Apply Kalman filter to reduce jitter
+            # Apply Kalman filter based on mode
             R_measured, _ = cv2.Rodrigues(rvec)
             t_measured = tvec.reshape(3)
-            t_filtered, R_filtered = state['kalman_filter'].update(t_measured, R_measured)
+            if FAST_MODE:
+                # Skip Kalman filter for faster processing
+                t_filtered, R_filtered = t_measured, R_measured
+            else:
+                # Apply Kalman filter to reduce jitter
+                t_filtered, R_filtered = state['kalman_filter'].update(t_measured, R_measured)
 
             # Lock in
-            state.update({'locked': True, 'dict_id': did, 'first_off': guess_off,
+            state.update({'locked': True, 'dict_id': did, 'first_off': 0,
                           'board': board, 'detector': det})
-            print(f"[ChArUco] Locked dict={did}, firstMarkerId={guess_off}, "
-                  f"markers={len(ids)}, charuco={int(retval)}")
+            print(f"[ChArUco] Locked dict={did}, firstMarkerId=0, "
+                  f"markers={state['last_markers']}, charuco={state['last_charuco']}")
 
             if debug_img is not None:
-                cv2.aruco.drawDetectedCornersCharuco(debug_img, ch_corners, ch_ids)
+                cv2.aruco.drawDetectedCornersCharuco(debug_img, charuco_corners, charuco_ids)
+                # Draw bounding boxes around detected elements
+                draw_bounding_boxes(debug_img, charuco_corners, charuco_ids, marker_corners, marker_ids)
                 draw_counts(debug_img, state['last_markers'], state['last_charuco'])
 
             return R_filtered, t_filtered
 
         return None
 
-    # locked path: reuse board/detector and adjust ids each time
+    # locked path: reuse board/detector and detect board directly
     board, det = state['board'], state['detector']
-    corners, ids, _ = det.detectMarkers(undistorted_img)
-    state['last_markers'] = 0 if ids is None else int(len(ids))
     
-    # Apply subpixel refinement to marker corners
-    if corners is not None and len(corners) > 0:
-        gray_img = cv2.cvtColor(undistorted_img, cv2.COLOR_BGR2GRAY)
-        refined_corners = []
-        for i in range(len(corners)):
-            refined_corner = cv2.cornerSubPix(gray_img, corners[i], (5, 5), (-1, -1), 
-                                            (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.1))
-            refined_corners.append(refined_corner)
-        corners = refined_corners
+    # Use the new CharucoDetector API
+    charuco_corners, charuco_ids, marker_corners, marker_ids = det.detectBoard(undistorted_img)
+    state['last_charuco'] = 0 if charuco_ids is None else int(len(charuco_ids))
+    state['last_markers'] = 0 if marker_ids is None else int(len(marker_ids))
     
-    if debug_img is not None and ids is not None and len(ids) > 0:
-        cv2.aruco.drawDetectedMarkers(debug_img, corners, ids)
+    if debug_img is not None and charuco_ids is not None and len(charuco_ids) > 0:
+        cv2.aruco.drawDetectedCornersCharuco(debug_img, charuco_corners, charuco_ids)
+        # Draw bounding boxes around detected elements
+        draw_bounding_boxes(debug_img, charuco_corners, charuco_ids, marker_corners, marker_ids)
 
-    if ids is None or len(ids) < 4:
+    if charuco_ids is None or len(charuco_ids) < 10:
         if debug_img is not None:
-            draw_counts(debug_img, state['last_markers'], 0)
+            draw_counts(debug_img, 0, state['last_charuco'])
         return None
 
-    dict_sz = _dict_size(state['dict_id'])
-    ids_adj = _adjust_ids(ids, state['first_off'], dict_sz)
-
-    retval, ch_corners, ch_ids = cv2.aruco.interpolateCornersCharuco(corners, ids_adj, undistorted_img, board)
-    state['last_charuco'] = 0 if (retval is None) else int(retval)
-    if retval is None or retval < 10:
-        if debug_img is not None:
-            draw_counts(debug_img, state['last_markers'], state['last_charuco'])
-        return None
-
-    # Additional subpixel refinement for ChArUco corners
-    if ch_corners is not None and len(ch_corners) > 0:
+    # Apply subpixel refinement based on mode
+    if charuco_corners is not None and len(charuco_corners) > 0 and not FAST_MODE:
         # Convert to float32 for subpixel refinement
-        ch_corners_float = np.array(ch_corners, dtype=np.float32)
+        ch_corners_float = np.array(charuco_corners, dtype=np.float32)
         # Convert BGR to grayscale for subpixel refinement
         gray_img = cv2.cvtColor(undistorted_img, cv2.COLOR_BGR2GRAY)
         # Apply subpixel corner refinement
         cv2.cornerSubPix(gray_img, ch_corners_float, (5, 5), (-1, -1), 
                         (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.1))
-        ch_corners = ch_corners_float
+        charuco_corners = ch_corners_float
 
-    ok, rvec, tvec = cv2.aruco.estimatePoseCharucoBoard(ch_corners, ch_ids, board, K, dist, None, None)
+    # Use solvePnP directly with board object points
+    obj_points = board.getChessboardCorners()
+    ok, rvec, tvec = cv2.solvePnP(obj_points[charuco_ids.flatten()], charuco_corners, K, dist)
     if not ok:
         if debug_img is not None:
-            draw_counts(debug_img, state['last_markers'], state['last_charuco'])
+            draw_counts(debug_img, 0, state['last_charuco'])
         return None
 
-    # Apply Kalman filter to reduce jitter
+    # Apply Kalman filter based on mode
     R_measured, _ = cv2.Rodrigues(rvec)
     t_measured = tvec.reshape(3)
-    t_filtered, R_filtered = state['kalman_filter'].update(t_measured, R_measured)
+    if FAST_MODE:
+        # Skip Kalman filter for faster processing
+        t_filtered, R_filtered = t_measured, R_measured
+    else:
+        # Apply Kalman filter to reduce jitter
+        t_filtered, R_filtered = state['kalman_filter'].update(t_measured, R_measured)
 
     if debug_img is not None:
-        cv2.aruco.drawDetectedCornersCharuco(debug_img, ch_corners, ch_ids)
+        cv2.aruco.drawDetectedCornersCharuco(debug_img, charuco_corners, charuco_ids)
+        # Draw bounding boxes around detected elements
+        draw_bounding_boxes(debug_img, charuco_corners, charuco_ids, marker_corners, marker_ids)
         draw_counts(debug_img, state['last_markers'], state['last_charuco'])
 
     return R_filtered, t_filtered
@@ -444,23 +499,48 @@ def handeye_residuals(Rg, tg, Rt, tt, R_cam2base, t_cam2base):
                                             median=float(np.median(a)),
                                             p95=float(np.percentile(a,95)))
     return dict(rot_deg=stats(rots), trans_m=stats(trans))
-    
-    # Keeping residuals only; defer detailed validation to MoveArm3.py
-    
+
 # =========================
 # Main
 # =========================
 def main():
-    parser = argparse.ArgumentParser(description="Eye-in-Hand hand-eye calibration (terminal-friendly)")
+    parser = argparse.ArgumentParser(description="Eye-in-Hand hand-eye calibration for Orbbec Camera (terminal-friendly)")
     parser.add_argument("--mode", choices=["gui", "ascii", "ascii_hi", "headless"],
                         default=("gui" if os.environ.get("DISPLAY") else "ascii"),
                         help="Display mode: OpenCV GUI, ASCII in terminal, or headless")
-    parser.add_argument("--camera", choices=["auto", "realsense", "opencv", "orbbec"], default="auto",
-                        help="Camera backend to use: RealSense (if available) or OpenCV UVC")
+    parser.add_argument("--camera", choices=["auto", "orbbec", "realsense", "opencv"], default="orbbec",
+                        help="Camera backend to use: Orbbec (default), RealSense (if available) or OpenCV UVC")
+    parser.add_argument("--fast", action="store_true", default=True,
+                        help="Enable fast mode (skip subpixel refinement and Kalman filtering)")
+    parser.add_argument("--accurate", action="store_true", default=False,
+                        help="Enable accurate mode (slower but more precise)")
+    parser.add_argument("--ultra-fast", action="store_true", default=False,
+                        help="Enable ultra-fast mode (maximum speed, lower resolution)")
     args = parser.parse_args()
+    
+    # Set performance mode based on arguments
+    global FAST_MODE, ULTRA_FAST_MODE, SKIP_UNDISTORTION, ORBBEC_WIDTH, ORBBEC_HEIGHT
+    
+    if args.ultra_fast:
+        ULTRA_FAST_MODE = True
+        FAST_MODE = True
+        SKIP_UNDISTORTION = True
+        ORBBEC_WIDTH = 1280  # Lower resolution for speed
+        ORBBEC_HEIGHT = 720
+        print("🚀 Running in ULTRA-FAST mode (maximum speed, lower resolution)")
+    elif args.accurate:
+        FAST_MODE = False
+        ULTRA_FAST_MODE = False
+        SKIP_UNDISTORTION = False
+        print("🔬 Running in ACCURATE mode (slower but more precise)")
+    else:
+        FAST_MODE = True
+        ULTRA_FAST_MODE = False
+        SKIP_UNDISTORTION = False
+        print("⚡ Running in FAST mode (faster but less precise)")
 
     print("\n=== Instructions ===")
-    print("• Mount RealSense rigidly on the gripper (eye-in-hand).")
+    print("• Mount Orbbec camera rigidly on the gripper (eye-in-hand).")
     print("• Fix ChArUco board rigidly in the environment.")
     print("• Move to varied poses (large rotations + translations).")
     if args.mode == "gui":
@@ -468,8 +548,8 @@ def main():
     else:
         print("• In terminal, press SPACE to capture, q to finish.\n")
 
-    print("Opening camera...")
-    rs_cam = RealSenseSource(REALSENSE_WIDTH, REALSENSE_HEIGHT, REALSENSE_FPS, camera_kind=args.camera)
+    print("Opening Orbbec camera...")
+    orbbec_cam = OrbbecSource(ORBBEC_WIDTH, ORBBEC_HEIGHT, ORBBEC_FPS, camera_kind=args.camera)
 
     print("Connecting xArm...")
     xarm = XArmClient(XARM_IP)
@@ -480,19 +560,52 @@ def main():
     captured_images = []  # Store captured images for saving
 
     last_Rg, last_tg = None, None
+    frame_skip_counter = 0  # For frame skipping in ultra-fast mode
 
     display = Display(args.mode)
+    
+    # Give camera time to initialize
+    print("Waiting for camera to initialize...")
+    import time
+    time.sleep(2)
+    
+    # Try to read a few frames to ensure camera is working
+    camera_ready = False
+    for attempt in range(10):
+        ok, color = orbbec_cam.read()
+        if ok and color is not None:
+            print(f"✓ Camera ready after {attempt + 1} attempts")
+            camera_ready = True
+            break
+        print(f"Camera initialization attempt {attempt + 1}/10...")
+        time.sleep(0.5)
+    
+    if not camera_ready:
+        print("❌ Camera failed to initialize after 10 attempts")
+        return
+    
     try:
         while True:
-            ok, color = rs_cam.read()
+            ok, color = orbbec_cam.read()
             if not ok or color is None:
                 print("Camera read failed")
                 break
 
-            # Undistort the image for accurate ArUco detection
-            undistorted = cv2.undistort(color, K, dist)
-            vis = undistorted.copy()
-            det = estimate_charuco_pose(undistorted, K, dist, debug_img=vis, state=ch_state)
+            # Skip frames in ultra-fast mode for even more speed
+            if ULTRA_FAST_MODE:
+                frame_skip_counter += 1
+                if frame_skip_counter % 2 != 0:  # Process every other frame
+                    continue
+
+            # Undistort the image for accurate ArUco detection (skip in ultra-fast mode)
+            if SKIP_UNDISTORTION:
+                undistorted = color  # Use raw image for maximum speed
+                vis = color.copy()
+                det = estimate_charuco_pose(undistorted, K, dist, debug_img=vis, state=ch_state)
+            else:
+                undistorted = cv2.undistort(color, K, dist)
+                vis = undistorted.copy()
+                det = estimate_charuco_pose(undistorted, K, dist, debug_img=vis, state=ch_state)
 
             if det is not None:
                 R, t = det
@@ -573,13 +686,12 @@ def main():
                         "timestamp": pose_num  # You could add actual timestamp here if needed
                     }, allow_pickle=True)
                     
-                    
                     print(f"Captured #{pose_num}  (markers:{ch_state['last_markers']}, charuco:{ch_state['last_charuco']})")
                     print(f"Saved → {img_name}")
                     print(f"Saved → {SAVE_DIR}/pose{pose_num:03d}.npy")
     finally:
         display.close()
-        rs_cam.close()
+        orbbec_cam.close()
         # xarm.close()
 
     n = len(R_g2b_list)
@@ -677,9 +789,9 @@ def main():
 
     np.set_printoptions(precision=6, suppress=True)
     print("\n=== T_cam2gripper (camera to gripper transformation) ===")
-    print(T_cam2base_4x4)
+    print(T_cam2gripper)
     print("\n=== t_cam2gripper (translation vector) ===")
-    print(t_cam2base)
+    print(t_cam2gripper)
     
     # Determine the selected method name
     selected_method = "PARK" if calibration_results.get('PARK') is not None else "FALLBACK"
@@ -691,15 +803,15 @@ def main():
     
     # Save all calibration results with method name
     save_data = {
-        "t_cam2grip": t_cam2base,
-        "R_cam2grip": R_cam2base,
-        "T_cam2grip": T_cam2base_4x4,
+        "t_cam2grip": t_cam2gripper,
+        "R_cam2grip": R_cam2gripper,
+        "T_cam2grip": T_cam2gripper,
         "all_methods": calibration_results,
         "selected_method": selected_method
     }
     
     # Save with method name in filename
-    method_filename = f"eyeinhand_{selected_method.lower()}"
+    method_filename = f"eyeinhand_orbbec_{selected_method.lower()}"
     np.save(f"{SAVE_DIR}/result_{method_filename}.npy", save_data, allow_pickle=True)
     np.savez(f"../output/{method_filename}.npz", **save_data)
     
@@ -714,7 +826,7 @@ def main():
                 "T_cam2grip": to_homogeneous(result['R'], result['t'])
             }
             np.savez(f"{SAVE_DIR}/calibration_{method_name.lower()}.npz", **method_data)
-            np.savez(f"../output/eyeinhand_{method_name.lower()}.npz", **method_data)
+            np.savez(f"../output/eyeinhand_orbbec_{method_name.lower()}.npz", **method_data)
 
     res = handeye_residuals(Rg, tg, Rt, tt, R_cam2base, t_cam2base)
     if res:
@@ -726,7 +838,7 @@ def main():
     print(f"Total poses captured: {len(R_g2b_list)}")
     print(f"Pose pairs saved to: {SAVE_DIR}")
     print(f"Main calibration result saved to: ../output/{method_filename}.npz")
-    print(f"Individual method results saved to: ../output/eyeinhand_{{method}}.npz")
+    print(f"Individual method results saved to: ../output/eyeinhand_orbbec_{{method}}.npz")
     
     # Print summary of all methods
     print(f"\n=== Calibration Methods Summary ===")

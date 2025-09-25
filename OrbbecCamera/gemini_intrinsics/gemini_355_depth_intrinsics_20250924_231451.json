@@ -1,0 +1,18 @@
+{
+  "orbbec_gemini_355_depth": {
+    "fx": 622.5604248046875,
+    "fy": 622.5604248046875,
+    "cx": 640.5,
+    "cy": 401.0,
+    "width": 1280,
+    "height": 800,
+    "distortion": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "description": "Orbbec Gemini 355 Depth intrinsics - Auto-extracted (1280x800)"
+  }
+}
