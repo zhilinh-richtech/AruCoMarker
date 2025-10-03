@@ -13,10 +13,11 @@ import tty
 from scipy.spatial.transform import Rotation as R
 
 # Import from Realsense directory
-sys.path.append('../Realsense')
+sys.path.insert(0, '../Realsense')
 from utils import rpy_to_matrix, rot_angle_deg, to_homogeneous, invert_rt, to_cv_lists, rel_motion
 from camera import create_camera
 from terminal_display import Display, draw_axes_ascii_friendly
+sys.path.pop(0)  # Remove from path after import to avoid conflicts
 
 # =========================
 # CONFIG
@@ -37,10 +38,10 @@ ORBBEC_FPS = 30
 # calib.io ChArUco board (you said: rows=4, columns=6)
 CHARUCO_SQUARES_X = 5       # columns (X across)
 CHARUCO_SQUARES_Y = 7       # rows    (Y down)
-SQUARE_LEN_M      = 0.034  # measure your printed square side (meters)
+SQUARE_LEN_M      = 0.0345  # measure your printed square side (meters)
 MARKER_LEN_RATIO  = 0.81     # calib.io default unless you changed it
 MARKER_LEN_M      = MARKER_LEN_RATIO * SQUARE_LEN_M  # measure your printed marker side (meters)
-MARKER_LEN_M      = 0.0274
+MARKER_LEN_M      = 0.0276
 # If you KNOW these, set them; otherwise leave None to auto-lock from the image
 ARUCO_DICT_ID    = None     # e.g. cv2.aruco.DICT_4X4_250
 FIRST_MARKER_ID  = None     # e.g. 17

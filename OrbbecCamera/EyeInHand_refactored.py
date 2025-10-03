@@ -10,10 +10,11 @@ from scipy.spatial.transform import Rotation as R
 from xarm.wrapper import XArmAPI
 
 # Import from Realsense directory
-sys.path.append('../Realsense')
+sys.path.insert(0, '../Realsense')
 from utils import rpy_to_matrix, rot_angle_deg, to_homogeneous, invert_rt, to_cv_lists, rel_motion
 from camera import create_camera
 from terminal_display import Display, draw_axes_ascii_friendly
+sys.path.pop(0)  # Remove from path after import to avoid conflicts
 
 # =========================
 # CONFIG
@@ -37,8 +38,8 @@ CHARUCO_SQUARES_Y = 7       # rows    (Y down)
 
 # CRITICAL FOR ACCURACY: Measure these with digital calipers (±0.01mm precision)
 # Each 0.1mm error in these measurements can cause 2-5mm final calibration error!
-SQUARE_LEN_M = 0.034        # MEASURE YOUR ACTUAL PRINTED SQUARE SIDE (meters)
-MARKER_LEN_M = 0.0274       # MEASURE YOUR ACTUAL PRINTED MARKER SIDE (meters)
+SQUARE_LEN_M = 0.03714        # MEASURE YOUR ACTUAL PRINTED SQUARE SIDE (meters)
+MARKER_LEN_M = 0.02956       # MEASURE YOUR ACTUAL PRINTED MARKER SIDE (meters)
 
 # Validation: Check for reasonable values
 if abs(MARKER_LEN_M / SQUARE_LEN_M - 0.8) > 0.1:
@@ -63,10 +64,10 @@ ARUCO_DICT_ID    = None     # e.g. cv2.aruco.DICT_4X4_250
 FIRST_MARKER_ID  = None     # e.g. 17
 
 # HIGH ACCURACY: Stricter pose diversity requirements (reduce conditioning errors)
-MIN_ANGLE_DEG    = 15.0     # Larger angle changes between poses (was 8.0)
-MIN_TRANS_M      = 0.05     # Larger translation changes (was 0.03)
-MIN_SAMPLES      = 5        # More minimum samples (was 3)
-TARGET_SAMPLES   = 30       # More total samples for better accuracy (was 20)
+MIN_ANGLE_DEG    = 20.0     # Larger angle changes between poses - FORCE more diversity
+MIN_TRANS_M      = 0.08     # Larger translation changes - FORCE more diversity
+MIN_SAMPLES      = 8        # More minimum samples
+TARGET_SAMPLES   = 35       # More total samples for better accuracy
 MIN_CHARUCO_CORNERS = 20    # Require more corners for accurate pose estimation (was 10)
 
 AXIS_LEN_M       = 0.08
@@ -75,33 +76,43 @@ SAVE_DIR         = "../output/poses_orbbec"  # Directory to save pose pairs
 # Load Orbbec intrinsics/distortion from calibration file
 # You'll need to create this file using OrbbecIntrinsics.py first
 try:
-    calib = np.load("../output/orbbec_calibration.npz")
-    K = calib["camera_matrix"]
-    dist = calib["dist_coeffs"]
+    import json
 
-    print("✓ Loaded Orbbec calibration")
+    # Load from JSON file - use latest calibration with fixed IPPE
+    intrinsics_file = "../output/orbbec_calibration_20250929_204146.json"
+    with open(intrinsics_file, 'r') as f:
+        calib_data = json.load(f)
+
+    # Extract camera matrix and distortion coefficients
+    K = np.array(calib_data["camera_matrix"], dtype=np.float64)
+    dist = np.array(calib_data["dist_coeffs"], dtype=np.float64)
+
+    print("✓ Loaded Orbbec calibration from JSON")
     print(f"📷 Camera matrix focal lengths: fx={K[0,0]:.1f}, fy={K[1,1]:.1f}")
     print(f"   Principal point: cx={K[0,2]:.1f}, cy={K[1,2]:.1f}")
     print(f"   Distortion coeffs: {[f'{d:.4f}' for d in dist.flatten()]}")
 
     # CRITICAL: Validate calibration quality
-    if 'reprojection_error' in calib:
-        reproj_error = float(calib['reprojection_error'])
+    if 'reprojection_error' in calib_data:
+        reproj_error = float(calib_data['reprojection_error'])
         print(f"🎯 Camera reprojection error: {reproj_error:.3f} pixels")
 
-        if reproj_error > 1.0:
+        if reproj_error > 0.8:
             print("❌ CRITICAL: Poor camera calibration!")
-            print(f"   Reprojection error {reproj_error:.3f} pixels will cause 5-15mm hand-eye errors")
-            print("   Please recalibrate camera with:")
-            print("   - More images (50+)")
-            print("   - Better coverage of field of view")
-            print("   - Steadier image capture")
+            print(f"   Reprojection error {reproj_error:.3f} pixels will cause 10-50mm hand-eye errors")
+            print("   🔧 REQUIRED: Recalibrate camera with:")
+            print("   - 50+ high-quality images")
+            print("   - Full field of view coverage")
+            print("   - Sharp focus throughout")
+            print("   - Various distances and angles")
+            print("   - Steady capture (no motion blur)")
             response = input("Continue anyway? (y/N): ")
             if response.lower() != 'y':
                 sys.exit(1)
-        elif reproj_error > 0.5:
+        elif reproj_error > 0.4:
             print("⚠️  WARNING: Moderate calibration error")
-            print(f"   {reproj_error:.3f} pixels may cause 2-5mm final errors")
+            print(f"   {reproj_error:.3f} pixels may cause 3-10mm final errors")
+            print("   📈 Recommend: Recalibrate for better accuracy")
         else:
             print("✅ Excellent calibration quality!")
     else:
@@ -115,98 +126,46 @@ try:
         print("⚠️  WARNING: Large focal length difference - check for aspect ratio issues")
 
 except FileNotFoundError:
-    print("❌ Orbbec calibration file not found!")
-    print("Please run OrbbecIntrinsics.py first to generate ../output/orbbec_calibration.npz")
-    print("Or create a calibration file with 'camera_matrix' and 'dist_coeffs' keys")
+    print(f"❌ Orbbec calibration file not found: {intrinsics_file}")
+    print("Please check the file path")
     sys.exit(1)
 except KeyError as e:
     print(f"❌ Missing key in calibration file: {e}")
     print("Expected keys: 'camera_matrix', 'dist_coeffs'")
     sys.exit(1)
 
-# =========================
-# Kalman Filter for 6-DoF Pose
-# =========================
-class PoseKalmanFilter:
-    def __init__(self, process_noise=0.01, measurement_noise=0.1):
-        """
-        Kalman filter for 6-DoF pose tracking
-        State: [x, y, z, qx, qy, qz, qw, vx, vy, vz, wx, wy, wz] (13D)
-        """
-        self.dt = 1.0/30.0  # Assume 30 FPS
-        self.state_dim = 13
-        self.measurement_dim = 7  # [x, y, z, qx, qy, qz, qw]
-        
-        # State vector: [position, quaternion, velocity, angular_velocity]
-        self.x = np.zeros(self.state_dim)
-        self.P = np.eye(self.state_dim) * 10.0  # Covariance matrix
-        
-        # Process noise
-        self.Q = np.eye(self.state_dim) * process_noise
-        
-        # Measurement noise
-        self.R = np.eye(self.measurement_dim) * measurement_noise
-        
-        # Measurement matrix
-        self.H = np.zeros((self.measurement_dim, self.state_dim))
-        self.H[:7, :7] = np.eye(7)  # Direct measurement of pose
-        
-        self.initialized = False
-    
-    def update(self, position, rotation_matrix):
-        """Update filter with new pose measurement"""
-        # Convert rotation matrix to quaternion
-        r = R.from_matrix(rotation_matrix)
-        quat = r.as_quat()  # [x, y, z, w]
-        
-        # Measurement vector
-        z = np.array([position[0], position[1], position[2], 
-                     quat[0], quat[1], quat[2], quat[3]])
-        
-        if not self.initialized:
-            # Initialize state
-            self.x[:3] = position
-            self.x[3:7] = quat
-            self.initialized = True
-            return position, rotation_matrix
-        
-        # Prediction step
-        F = self._get_transition_matrix()
-        self.x = F @ self.x
-        self.P = F @ self.P @ F.T + self.Q
-        
-        # Update step
-        y = z - self.H @ self.x  # Innovation
-        S = self.H @ self.P @ self.H.T + self.R  # Innovation covariance
-        K = self.P @ self.H.T @ np.linalg.inv(S)  # Kalman gain
-        
-        self.x = self.x + K @ y
-        self.P = (np.eye(self.state_dim) - K @ self.H) @ self.P
-
-        # CRITICAL: Normalize quaternion after update to maintain unit constraint
-        quat_norm = np.linalg.norm(self.x[3:7])
-        if quat_norm > 0:
-            self.x[3:7] /= quat_norm
-
-        # Extract filtered pose
-        filtered_position = self.x[:3]
-        filtered_quat = self.x[3:7]
-        
-        # Convert quaternion back to rotation matrix
-        r_filtered = R.from_quat(filtered_quat)
-        filtered_rotation = r_filtered.as_matrix()
-        
-        return filtered_position, filtered_rotation
-    
-    def _get_transition_matrix(self):
-        """Get state transition matrix for constant velocity model"""
-        F = np.eye(self.state_dim)
-        F[:3, 7:10] = np.eye(3) * self.dt  # position += velocity * dt
-        return F
+# (Kalman filter removed per request; using raw pose outputs only)
 
 # =========================
 # Utilities
 # =========================
+def euler_angles_to_rotation_matrix(rx, ry, rz):
+    # Compute the rotation matrix
+    Rx = np.array([[1, 0, 0],
+                   [0, np.cos(rx), -np.sin(rx)],
+                   [0, np.sin(rx), np.cos(rx)]])
+
+    Ry = np.array([[np.cos(ry), 0, np.sin(ry)],
+                   [0, 1, 0],
+                   [-np.sin(ry), 0, np.cos(ry)]])
+
+    Rz = np.array([[np.cos(rz), -np.sin(rz), 0],
+                   [np.sin(rz), np.cos(rz), 0],
+                   [0, 0, 1]])
+
+    R = Rz @ Ry @ Rx
+    return R
+
+def pose_to_homogeneous_matrix(pose):
+    x, y, z, rx, ry, rz = pose
+    R = euler_angles_to_rotation_matrix(rx, ry, rz)
+    t = np.array([x, y, z]).reshape(3, 1)
+
+    H = np.eye(4)
+    H[:3, :3] = R
+    H[:3, 3] = t[:, 0]
+    return H
+
 def euler_rpy_to_R(roll, pitch, yaw, degrees=True):
     # Delegate to shared utility. utils.rpy_to_matrix expects degrees.
     if not degrees:
@@ -320,7 +279,6 @@ def make_charuco_state():
         'candidates': {},    # dict_id -> (board, detector)
         'last_markers': 0,
         'last_charuco': 0,
-        'kalman_filter': PoseKalmanFilter(process_noise=0.01, measurement_noise=0.1),
     }
     if ARUCO_DICT_ID is not None:
         board, det = _make_board_and_detector(ARUCO_DICT_ID)
@@ -342,50 +300,42 @@ def draw_counts(img, markers, charuco):
     cv2.putText(img, f"charuco:{charuco}", (20,130), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,255), 2)
 
 def draw_bounding_boxes(img, charuco_corners, charuco_ids, marker_corners=None, marker_ids=None):
-    """Draw bounding boxes around detected ChArUco corners and markers"""
+    """Draw oriented bounding boxes around detected ChArUco corners and markers"""
     try:
-        # # Draw bounding boxes around ChArUco corners
-        # if charuco_corners is not None and charuco_ids is not None and len(charuco_corners) > 0:
-        #     for i, corner in enumerate(charuco_corners):
-        #         # ChArUco corners are individual points, not 4-point polygons
-        #         if len(corner.shape) == 2 and corner.shape[1] == 2:  # Shape (1, 2) for single corner
-        #             x, y = int(corner[0, 0]), int(corner[0, 1])
-        #             # Draw a medium-sized box around the corner point
-        #             box_size = 15  # Medium-sized box for visibility
-        #             x_min, x_max = x - box_size, x + box_size
-        #             y_min, y_max = y - box_size, y + box_size
-                    
-        #             # Draw bounding box in cyan with thin lines
-        #             cv2.rectangle(img, (x_min, y_min), (x_max, y_max), (255, 255, 0), 1)  # Thin line
-                    
-        #             # Add corner ID label with smaller font
-        #             if i < len(charuco_ids):
-        #                 cv2.putText(img, f"Ch{charuco_ids[i]}", (x_min, y_min-5), 
-        #                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)  # Medium font
-        
-        # Draw bounding boxes around individual markers
+        # Draw small circles around ChArUco corners
+        if charuco_corners is not None and charuco_ids is not None and len(charuco_corners) > 0:
+            for i, corner in enumerate(charuco_corners):
+                # ChArUco corners are individual points, not 4-point polygons
+                if len(corner.shape) == 2 and corner.shape[1] == 2:  # Shape (1, 2) for single corner
+                    x, y = int(corner[0, 0]), int(corner[0, 1])
+                    # Draw a small circle around the corner point
+                    cv2.circle(img, (x, y), 8, (255, 255, 0), 2)  # Yellow circle
+
+                    # Add corner ID label
+                    if i < len(charuco_ids):
+                        cv2.putText(img, f"Ch{charuco_ids[i][0]}", (x + 12, y - 5),
+                                  cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
+
+        # Draw oriented bounding boxes around individual markers
         if marker_corners is not None and marker_ids is not None and len(marker_corners) > 0:
             for i, corners in enumerate(marker_corners):
                 # ArUco marker corners have shape (1, 4, 2)
                 if len(corners.shape) == 3 and corners.shape[1] == 4:
-                    # Get bounding rectangle for this marker
-                    x_coords = corners[0][:, 0]
-                    y_coords = corners[0][:, 1]
-                    x_min, x_max = int(np.min(x_coords)), int(np.max(x_coords))
-                    y_min, y_max = int(np.min(y_coords)), int(np.max(y_coords))
-                    
-                    # Expand the bounding box for better visibility
-                    margin = 10
-                    x_min, x_max = x_min - margin, x_max + margin
-                    y_min, y_max = y_min - margin, y_max + margin
-                    
-                    # Draw bounding box in green with thin lines
-                    cv2.rectangle(img, (x_min, y_min), (x_max, y_max), (0, 255, 0), 1)  # Thin line
-                    
-                    # Add marker ID label with smaller font
+                    # Get the 4 corner points of the marker
+                    pts = corners[0].astype(np.int32)  # Shape: (4, 2)
+
+                    # Draw the oriented quadrilateral (follows marker rotation)
+                    cv2.polylines(img, [pts], True, (0, 255, 0), 2)  # Green oriented outline
+
+                    # Add marker ID label at the top-left corner
                     if i < len(marker_ids):
-                        cv2.putText(img, f"M{marker_ids[i][0]}", (x_min, y_min-5), 
-                                  cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)  # Medium font
+                        # Find the "top-left" corner (closest to origin)
+                        distances = np.sum(pts**2, axis=1)
+                        top_left_idx = np.argmin(distances)
+                        label_x, label_y = pts[top_left_idx]
+
+                        cv2.putText(img, f"M{marker_ids[i][0]}", (label_x - 10, label_y - 10),
+                                  cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
     except Exception as e:
         print(f"Error in draw_bounding_boxes: {e}")
         import traceback
@@ -456,13 +406,28 @@ def estimate_charuco_pose(raw_img, K, dist, debug_img=None, state=None):
                     draw_counts(debug_img, state['last_markers'], state['last_charuco'])
                 continue
 
-            # Step 2: Iterative refinement using IPPE result as initial guess
+            # Step 2: Select best IPPE solution and refine with iterative
+            # IPPE returns two solutions for planar objects - pick the one with positive Z
+            best_rvec_ippe = None
+            best_tvec_ippe = None
+            for i in range(len(rvecs_ippe)):
+                if tvecs_ippe[i][2] > 0:  # Board should be in front of camera (positive Z)
+                    best_rvec_ippe = rvecs_ippe[i]
+                    best_tvec_ippe = tvecs_ippe[i]
+                    break
+
+            # Fallback to first solution if no positive Z found
+            if best_rvec_ippe is None:
+                best_rvec_ippe = rvecs_ippe[0]
+                best_tvec_ippe = tvecs_ippe[0]
+
+            # Iterative refinement using best IPPE result as initial guess
             ok, rvecs, tvecs, reprojErrors = cv2.solvePnPGeneric(
                 obj_points[charuco_ids.flatten()],
                 charuco_corners,
                 K, dist,  # Use full distortion model with raw images
-                rvec=rvecs_ippe[0],  # Use IPPE result as initial guess
-                tvec=tvecs_ippe[0],
+                rvec=best_rvec_ippe,  # Use best IPPE result as initial guess
+                tvec=best_tvec_ippe,
                 useExtrinsicGuess=True,
                 flags=cv2.SOLVEPNP_ITERATIVE  # Refine with iterative
             )
@@ -486,10 +451,9 @@ def estimate_charuco_pose(raw_img, K, dist, debug_img=None, state=None):
                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
                 continue
 
-            # Apply Kalman filter for smooth tracking
+            # Use raw measured pose (no Kalman filtering)
             R_measured, _ = cv2.Rodrigues(rvec)
             t_measured = tvec.reshape(3)
-            t_filtered, R_filtered = state['kalman_filter'].update(t_measured, R_measured)
 
             # Display accuracy info
             if debug_img is not None:
@@ -510,7 +474,7 @@ def estimate_charuco_pose(raw_img, K, dist, debug_img=None, state=None):
                 draw_bounding_boxes(debug_img, charuco_corners, charuco_ids, marker_corners, marker_ids)
                 draw_counts(debug_img, state['last_markers'], state['last_charuco'])
 
-            return R_filtered, t_filtered
+            return R_measured, t_measured
 
         return None
 
@@ -567,13 +531,28 @@ def estimate_charuco_pose(raw_img, K, dist, debug_img=None, state=None):
             draw_counts(debug_img, 0, state['last_charuco'])
         return None
 
-    # Step 2: Iterative refinement using IPPE result as initial guess
+    # Step 2: Select best IPPE solution and refine with iterative
+    # IPPE returns two solutions for planar objects - pick the one with positive Z
+    best_rvec_ippe = None
+    best_tvec_ippe = None
+    for i in range(len(rvecs_ippe)):
+        if tvecs_ippe[i][2] > 0:  # Board should be in front of camera (positive Z)
+            best_rvec_ippe = rvecs_ippe[i]
+            best_tvec_ippe = tvecs_ippe[i]
+            break
+
+    # Fallback to first solution if no positive Z found
+    if best_rvec_ippe is None:
+        best_rvec_ippe = rvecs_ippe[0]
+        best_tvec_ippe = tvecs_ippe[0]
+
+    # Iterative refinement using best IPPE result as initial guess
     ok, rvecs, tvecs, reprojErrors = cv2.solvePnPGeneric(
         obj_points[charuco_ids.flatten()],
         charuco_corners,
         K, dist,  # Use full distortion model with raw images
-        rvec=rvecs_ippe[0],  # Use IPPE result as initial guess
-        tvec=tvecs_ippe[0],
+        rvec=best_rvec_ippe,  # Use best IPPE result as initial guess
+        tvec=best_tvec_ippe,
         useExtrinsicGuess=True,
         flags=cv2.SOLVEPNP_ITERATIVE  # Refine with iterative
     )
@@ -596,10 +575,9 @@ def estimate_charuco_pose(raw_img, K, dist, debug_img=None, state=None):
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
         return None
 
-    # Apply Kalman filter for smooth tracking
+    # Use raw measured pose (no Kalman filtering)
     R_measured, _ = cv2.Rodrigues(rvec)
     t_measured = tvec.reshape(3)
-    t_filtered, R_filtered = state['kalman_filter'].update(t_measured, R_measured)
 
     # Display accuracy info
     if debug_img is not None:
@@ -614,7 +592,7 @@ def estimate_charuco_pose(raw_img, K, dist, debug_img=None, state=None):
         draw_bounding_boxes(debug_img, charuco_corners, charuco_ids, marker_corners, marker_ids)
         draw_counts(debug_img, state['last_markers'], state['last_charuco'])
 
-    return R_filtered, t_filtered
+    return R_measured, t_measured
 
 # =========================
 # xArm client
@@ -632,8 +610,20 @@ class XArmClient:
         if code != 0:
             raise RuntimeError(f"xArm get_position failed, code={code}")
         x, y, z, roll, pitch, yaw = pos
-        t_bg = np.array([x, y, z], dtype=np.float64) / 1000.0  # mm -> m
-        R_bg = euler_rpy_to_R(roll, pitch, yaw, degrees=USE_DEG)
+
+        # Convert position from mm to meters
+        t_bg = np.array([x, y, z], dtype=np.float64) / 1000.0
+
+        # Convert angles to radians if needed (your function expects radians)
+        if USE_DEG:
+            roll_rad = np.radians(roll)
+            pitch_rad = np.radians(pitch)
+            yaw_rad = np.radians(yaw)
+        else:
+            roll_rad, pitch_rad, yaw_rad = roll, pitch, yaw
+
+        # Use your custom function
+        R_bg = euler_angles_to_rotation_matrix(roll_rad, pitch_rad, yaw_rad)
         return R_bg, t_bg
 
     def close(self):
@@ -643,16 +633,16 @@ class XArmClient:
 # =========================
 # Residual diagnostics
 # =========================
-def handeye_residuals(Rg, tg, Rt, tt, R_cam2base, t_cam2base):
+def handeye_residuals(Rg, tg, Rt, tt, R_cam2gripper, t_cam2gripper):
     """
     Calculate residuals for eye-in-hand hand-eye calibration.
-    Rg: gripper poses in base frame (camera poses in base frame)
+    Rg: gripper poses in base frame
     tg: gripper translations in base frame
     Rt: target poses in camera frame
     tt: target translations in camera frame
-    R_cam2base, t_cam2base: camera to base transformation
+    R_cam2gripper, t_cam2gripper: camera to gripper transformation (what we're calibrating)
     """
-    X = to_homogeneous(R_cam2base, t_cam2base)
+    X = to_homogeneous(R_cam2gripper, t_cam2gripper)
     rots, trans = [], []
     for i in range(len(Rg) - 1):
         RA, tA = rel_motion(Rg[i], tg[i], Rg[i+1], tg[i+1])
@@ -807,25 +797,28 @@ def main():
                     print(f"⚠️  xArm read failed: {e}")
                     continue
 
-                # CORRECT: Store gripper pose (NOT camera pose)
-                # We're collecting gripper poses and target poses to find camera-to-gripper transform
-                R_g2b = R_bg  # gripper-to-base transformation (from robot)
-                t_g2b = t_bg  # gripper-to-base translation (from robot)
+                # CORRECT: Store gripper pose in base frame
+                # get_base_to_gripper() returns gripper pose IN base frame (not gripper-TO-base transform)
+                R_gripper_in_base = R_bg  # gripper pose in base frame (from robot)
+                t_gripper_in_base = t_bg  # gripper position in base frame (from robot)
 
                 accept = True
                 if last_Rg is not None:
-                    dR, dt = rel_motion(last_Rg, last_tg, R_g2b, t_g2b)
+                    dR, dt = rel_motion(last_Rg, last_tg, R_gripper_in_base, t_gripper_in_base)
                     ang = rot_angle_deg(dR); d = np.linalg.norm(dt)
+                    print(f"Movement: Δang={ang:.1f}°, Δt={d*1000:.1f}mm (need >{MIN_ANGLE_DEG:.0f}°, >{MIN_TRANS_M*1000:.0f}mm)")
                     if ang < MIN_ANGLE_DEG and d < MIN_TRANS_M:
-                        print(f"Pose too similar (Δang={ang:.1f}°, Δt={d*1000:.1f} mm); move more.")
+                        print(f"❌ Pose too similar! Need MORE movement.")
                         accept = False
+                    else:
+                        print(f"✅ Good movement diversity!")
 
                 if accept:
-                    R_g2b_list.append(R_g2b); t_g2b_list.append(t_g2b)
+                    R_g2b_list.append(R_gripper_in_base); t_g2b_list.append(t_gripper_in_base)
                     R, t = det
                     R_t2c_list.append(R); t_t2c_list.append(t)
                     captured_images.append(color.copy())  # Store the captured image
-                    last_Rg, last_tg = R_g2b, t_g2b
+                    last_Rg, last_tg = R_gripper_in_base, t_gripper_in_base
                     
                     # Save pose pair immediately
                     pose_num = len(R_g2b_list)
@@ -836,30 +829,49 @@ def main():
                     # Convert rotation matrices to Euler angles for saving
                     R_t2c_euler = cv2.Rodrigues(R)[0]  # Use R from det
                     
-                    # Calculate base to gripper transformation (inverse of gripper to base)
-                    R_base2gripper, t_base2gripper = invert_rt(R_g2b, t_g2b)
+                    # OpenCV calibrateHandEye expects gripper poses IN base frame
                     
                     # Save as JPG
                     img_name = f"{SAVE_DIR}/pose{pose_num:03d}.jpg"
                     cv2.imwrite(img_name, captured_images[-1])
                     
-                    # Save as NPY with base to gripper transformation
+                    # Save as NPY with gripper poses in base frame (for OpenCV calibrateHandEye)
                     np.save(f"{SAVE_DIR}/pose{pose_num:03d}.npy", {
-                        "R_base2gripper": R_base2gripper,      # Base to gripper rotation
-                        "t_base2gripper": t_base2gripper,      # Base to gripper translation
-                        "R_gripper2base": R_g2b,               # Original gripper to base (for reference)
-                        "t_gripper2base": t_g2b,               # Original gripper to base (for reference)
-                        "R_target2cam": R,                      # Target to camera (from det)
-                        "t_target2cam": t,                      # Target to camera (from det)
-                        "R_base2gripper_euler": cv2.Rodrigues(R_base2gripper)[0],  # Base to gripper in Euler angles
-                        "R_target2cam_euler": R_t2c_euler,                         # Target to camera in Euler angles
+                        "R_gripper_in_base": R_gripper_in_base,   # Gripper pose in base frame (from robot SDK)
+                        "t_gripper_in_base": t_gripper_in_base,   # Gripper position in base frame (from robot SDK)
+                        "R_target2cam": R,                        # Target to camera (from vision)
+                        "t_target2cam": t,                        # Target to camera (from vision)
                         "pose_number": pose_num,
                         "timestamp": pose_num  # You could add actual timestamp here if needed
                     }, allow_pickle=True)
                     
-                    print(f"Captured #{pose_num}  (markers:{ch_state['last_markers']}, charuco:{ch_state['last_charuco']})")
+                    # Check image focus quality
+                    gray = cv2.cvtColor(color, cv2.COLOR_BGR2GRAY)
+                    focus_measure = cv2.Laplacian(gray, cv2.CV_64F).var()
+
+                    print(f"Captured #{pose_num}  (markers:{ch_state['last_markers']}, charuco:{ch_state['last_charuco']}, focus:{focus_measure:.1f})")
+                    if focus_measure < 100:
+                        print("⚠️  WARNING: Low focus quality! Check camera focus.")
                     print(f"Saved → {img_name}")
                     print(f"Saved → {SAVE_DIR}/pose{pose_num:03d}.npy")
+
+                    # Print saved pose contents for verification
+                    try:
+                        np.set_printoptions(precision=5, suppress=True)
+                        print("— Pose contents (what was saved) —")
+                        print("  R_gripper_in_base:\n", R_gripper_in_base)
+                        print("  t_gripper_in_base (mm): ", (t_gripper_in_base*1000.0))
+                        print("  R_target2cam:\n", R)
+                        print("  t_target2cam (mm): ", (t*1000.0))
+                        # Convert R_gripper_in_base to RPY angles to compare with SDK
+                        from scipy.spatial.transform import Rotation as Rot
+                        gripper_rpy = Rot.from_matrix(R_gripper_in_base).as_euler('xyz', degrees=True)
+                        print("  Gripper RPY (deg) [matches SDK]: ", gripper_rpy)
+                        print("  R_target2cam_rvec (deg): ", (R_t2c_euler.reshape(3)*180.0/np.pi))
+                        print("  pose_number: ", pose_num)
+                        print("  timestamp: ", pose_num)
+                    except Exception as e:
+                        print(f"[WARN] Failed to print pose contents: {e}")
     finally:
         display.close()
         orbbec_cam.close()
@@ -904,6 +916,14 @@ def main():
         if mean_consistency > 5.0:
             print("⚠️  WARNING: High target detection variation! Check lighting and focus.")
 
+    print(f"\n🔍 DEBUG: Calibration input data:")
+    print(f"Number of poses: {len(R_g2b_list)}")
+    if len(R_g2b_list) > 0:
+        print(f"First gripper position (mm): [{t_g2b_list[0][0]*1000:.1f}, {t_g2b_list[0][1]*1000:.1f}, {t_g2b_list[0][2]*1000:.1f}]")
+        print(f"Last gripper position (mm): [{t_g2b_list[-1][0]*1000:.1f}, {t_g2b_list[-1][1]*1000:.1f}, {t_g2b_list[-1][2]*1000:.1f}]")
+        print(f"First target position (mm): [{t_t2c_list[0][0]*1000:.1f}, {t_t2c_list[0][1]*1000:.1f}, {t_t2c_list[0][2]*1000:.1f}]")
+        print(f"Last target position (mm): [{t_t2c_list[-1][0]*1000:.1f}, {t_t2c_list[-1][1]*1000:.1f}, {t_t2c_list[-1][2]*1000:.1f}]")
+
     print("\nRunning hand-eye calibration (eye-in-hand)...")
 
     # Try different calibration methods
@@ -919,7 +939,7 @@ def main():
     for method, name in methods:
         try:
             R, t = cv2.calibrateHandEye(
-                R_gripper2base=Rg, t_gripper2base=tg,  # Gripper poses in base frame (CORRECTED)
+                R_gripper2base=Rg, t_gripper2base=tg,  # Gripper poses in base frame (correct for eye-in-hand)
                 R_target2cam=Rt,  t_target2cam=tt,     # Target poses in camera frame
                 method=method
             )

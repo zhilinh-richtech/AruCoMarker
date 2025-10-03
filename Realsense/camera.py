@@ -180,4 +180,3 @@ def create_camera(kind: str = "auto", width: int = 1280, height: int = 800, fps:
         return OpenCVCamera(device_index=device, width=width, height=height, fps=fps)
     raise ValueError(f"Unknown camera kind: {kind}")
 
-
