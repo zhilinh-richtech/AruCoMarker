@@ -31,7 +31,7 @@ from pyorbbecsdk import Pipeline, Context, Config, OBStreamType, OBFormat, OBSen
 # Default marker parameters
 CHARUCO_SQUARES_X = 5       # columns (X across)
 CHARUCO_SQUARES_Y = 7       # rows    (Y down)
-SQUARE_LEN_M = 0.03714      # square side length in meters
+SQUARE_LEN_M = 0.037      # square side length in meters
 MARKER_LEN_M = SQUARE_LEN_M * 0.80  # marker side length in meters (80% of square)
 ARUCO_SIZE_M = 0.0500         # single ArUco marker size in meters
 ARUCO_DICT_ID = cv2.aruco.DICT_4X4_250
@@ -66,7 +66,7 @@ def from_homogeneous(T: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     return R, t
 
 
-def load_eye_in_hand_calibration(calib_path: str) -> Optional[Dict]:
+def load_eye_in_hand_calibration(calib_path: str, intrinsics_path: Optional[str] = None) -> Optional[Dict]:
     """Load eye-in-hand calibration results"""
     try:
         calib = np.load(calib_path, allow_pickle=True)
@@ -75,10 +75,40 @@ def load_eye_in_hand_calibration(calib_path: str) -> Optional[Dict]:
             'R_cam2gripper': calib['R_cam2gripper'],
             't_cam2gripper': calib['t_cam2gripper'],
             'T_cam2gripper': calib['T_cam2gripper'],
-            'camera_matrix': calib['camera_matrix'],
-            'dist_coeffs': calib['dist_coeffs'],
             'selected_method': str(calib.get('selected_method', 'unknown'))
         }
+
+        # Try to load camera intrinsics from the calibration file
+        if 'camera_matrix' in calib and 'dist_coeffs' in calib:
+            result['camera_matrix'] = calib['camera_matrix']
+            result['dist_coeffs'] = calib['dist_coeffs']
+        elif intrinsics_path is not None:
+            # Load from separate intrinsics file
+            print(f"  Loading camera intrinsics from: {intrinsics_path}")
+            if intrinsics_path.endswith('.npz'):
+                intr = np.load(intrinsics_path)
+                result['camera_matrix'] = intr['camera_matrix']
+                result['dist_coeffs'] = intr['dist_coeffs']
+            elif intrinsics_path.endswith('.json'):
+                import json
+                with open(intrinsics_path, 'r') as f:
+                    intr = json.load(f)
+                if 'camera_matrix' in intr:
+                    result['camera_matrix'] = np.array(intr['camera_matrix'])
+                    result['dist_coeffs'] = np.array(intr['dist_coeffs']).flatten()
+                else:
+                    # Try nested format
+                    for v in intr.values():
+                        if isinstance(v, dict) and 'fx' in v:
+                            fx, fy = v['fx'], v['fy']
+                            cx, cy = v['cx'], v['cy']
+                            result['camera_matrix'] = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
+                            result['dist_coeffs'] = np.array(v.get('distortion', [0]*5)).flatten()
+                            break
+        else:
+            print("⚠️  No camera intrinsics found in calibration file")
+            print("   Please provide --intrinsics parameter with camera calibration file")
+            return None
 
         # Optionally load all methods if present
         if 'all_methods' in calib:
@@ -479,6 +509,8 @@ def main():
     parser = argparse.ArgumentParser(description="Check eye-in-hand calibration")
     parser.add_argument("--calibration", default="./calibrate_result/EyeInHand.npz",
                        help="Eye-in-hand calibration file")
+    parser.add_argument("--intrinsics", type=str, default=None,
+                       help="Camera intrinsics file (.npz or .json) if not included in calibration file")
     parser.add_argument("--xarm-ip", default=XARM_IP,
                        help="xArm IP address")
     parser.add_argument("--camera-kind", default="orbbec",
@@ -505,7 +537,7 @@ def main():
     print()
 
     # Load calibration
-    calib = load_eye_in_hand_calibration(args.calibration)
+    calib = load_eye_in_hand_calibration(args.calibration, args.intrinsics)
     if calib is None:
         return
     print("calibration file content")

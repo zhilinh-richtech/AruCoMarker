@@ -447,7 +447,7 @@ def main():
                        help="Camera height (default: 1080)")
     parser.add_argument("--fps", type=int, default=30,
                        help="Camera FPS (default: 30)")
-    parser.add_argument("--output-dir", type=str, default="./new_poses_folder",
+    parser.add_argument("--output-dir", type=str, default="./testing_poses",
                        help="Output directory for images and poses (default: ../output/poses_images)")
     parser.add_argument("--radians", action="store_true",
                        help="Use radians for robot angles (default: degrees)")

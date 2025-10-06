@@ -40,7 +40,7 @@ class OrbbecImageSaver:
         self.pipeline = None
         self.config = None
         self.save_counter = 0
-        self.output_dir = "new_intriniscs_image"
+        self.output_dir = "test_intrinsics_image"
         
         # Create output directory if it doesn't exist
         os.makedirs(self.output_dir, exist_ok=True)

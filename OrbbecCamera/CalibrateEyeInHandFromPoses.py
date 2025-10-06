@@ -16,6 +16,7 @@ import os
 import glob
 import json
 import argparse
+import random
 from typing import Optional, Tuple, Dict, Any
 from scipy.spatial.transform import Rotation as Rsc
 
@@ -23,7 +24,7 @@ from scipy.spatial.transform import Rotation as Rsc
 # ChArUco board parameters (must match your physical board!)
 CHARUCO_SQUARES_X = 5       # columns (X across)
 CHARUCO_SQUARES_Y = 7       # rows    (Y down)
-SQUARE_LEN_M = 0.03718      # square side length in meters
+SQUARE_LEN_M = 0.037      # square side length in meters
 MARKER_LEN_M = SQUARE_LEN_M * 0.8  # marker side length in meters
 ARUCO_DICT_ID = cv2.aruco.DICT_4X4_250
 
@@ -284,10 +285,110 @@ def from_homogeneous(T: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     return R, t
 
 
+def detect_outliers_by_board_position(R_gripper2base_list, t_gripper2base_list,
+                                        R_target2cam_list, t_target2cam_list,
+                                        T_cam2gripper, std_threshold=2.5):
+    """
+    Detect outlier samples by checking board position consistency.
+    Returns indices of inlier samples.
+    """
+    def _to_T(R, t):
+        T = np.eye(4, dtype=np.float64)
+        T[:3, :3] = R
+        T[:3, 3] = t.reshape(3)
+        return T
+
+    # Compute board positions in base frame for all samples
+    T_board2base_list = []
+    for Rgb, tgb, Rtc, ttc in zip(R_gripper2base_list, t_gripper2base_list,
+                                    R_target2cam_list, t_target2cam_list):
+        T_gb = _to_T(Rgb, tgb)
+        T_tc = _to_T(Rtc, ttc)
+        T_bb = T_gb @ T_cam2gripper @ T_tc
+        T_board2base_list.append(T_bb)
+
+    # Get positions
+    positions = np.array([T[:3, 3] for T in T_board2base_list])
+
+    # Compute median position (more robust than mean)
+    median_pos = np.median(positions, axis=0)
+
+    # Compute distances from median
+    distances = np.linalg.norm(positions - median_pos, axis=1)
+
+    # Compute robust standard deviation using MAD (Median Absolute Deviation)
+    mad = np.median(np.abs(distances - np.median(distances)))
+    robust_std = mad * 1.4826  # scale factor for normal distribution
+
+    # Identify inliers
+    threshold = std_threshold * robust_std
+    inlier_mask = distances < threshold
+    inlier_indices = np.where(inlier_mask)[0].tolist()
+
+    return inlier_indices, distances, median_pos, robust_std
+
+
+def filter_by_known_board_position(R_gripper2base_list, t_gripper2base_list,
+                                     R_target2cam_list, t_target2cam_list,
+                                     T_cam2gripper, known_pos: np.ndarray,
+                                     tolerance: float = 0.050):
+    """
+    Filter samples based on known board position in robot base frame.
+
+    Args:
+        R_gripper2base_list: List of gripper rotation matrices
+        t_gripper2base_list: List of gripper translation vectors
+        R_target2cam_list: List of target rotation matrices in camera frame
+        t_target2cam_list: List of target translation vectors in camera frame
+        T_cam2gripper: Camera-to-gripper transformation
+        known_pos: Known board position [x, y, z] in base frame (meters)
+        tolerance: Tolerance for each axis (meters)
+
+    Returns:
+        inlier_indices: List of indices that match the known position
+        positions: All computed board positions
+        deviations: Deviation of each sample from known position
+    """
+    def _to_T(R, t):
+        T = np.eye(4, dtype=np.float64)
+        T[:3, :3] = R
+        T[:3, 3] = t.reshape(3)
+        return T
+
+    # Compute board positions in base frame for all samples
+    positions = []
+    for Rgb, tgb, Rtc, ttc in zip(R_gripper2base_list, t_gripper2base_list,
+                                    R_target2cam_list, t_target2cam_list):
+        T_gb = _to_T(Rgb, tgb)
+        T_tc = _to_T(Rtc, ttc)
+        T_bb = T_gb @ T_cam2gripper @ T_tc
+        positions.append(T_bb[:3, 3])
+
+    positions = np.array(positions)
+
+    # Check which samples are within tolerance for all specified axes
+    inlier_mask = np.ones(len(positions), dtype=bool)
+
+    # Initialize deviations array
+    deviations = np.zeros((len(positions), 3))
+
+    # Filter by each axis that has a known value (non-None)
+    for axis_idx in range(3):
+        if known_pos[axis_idx] is not None:
+            # Compute deviation for this axis
+            deviations[:, axis_idx] = np.abs(positions[:, axis_idx] - known_pos[axis_idx])
+            axis_ok = deviations[:, axis_idx] <= tolerance
+            inlier_mask &= axis_ok
+
+    inlier_indices = np.where(inlier_mask)[0].tolist()
+
+    return inlier_indices, positions, deviations
+
+
 def main():
     parser = argparse.ArgumentParser(description="Eye-in-hand calibration from pre-captured poses")
-    parser.add_argument("--poses-dir", default="./new_poses_folder",
-                       help="Directory containing pose images and .npy files")
+    parser.add_argument("--poses-dir", nargs='+', default=["./new_poses_folder"],
+                       help="One or more directories containing pose images and .npy files (space-separated)")
     parser.add_argument("--calibration", default="../output/orbbec_calibration_20251003_112009.json",
                        help="Camera calibration file (.npz or .json)")
     parser.add_argument("--output", default="./calibrate_result/EyeInHand.npz",
@@ -298,10 +399,28 @@ def main():
                        help="Save visualization images")
     parser.add_argument("--min-charuco", type=int, default=20,
                        help="Minimum number of ChArUco corners required per frame")
-    parser.add_argument("--max-reproj", type=float, default=0.1,
+    parser.add_argument("--max-reproj", type=float, default=0.5,
                        help="Maximum reprojection error in pixels (frames above this are rejected)")
-    parser.add_argument("--keep-top", type=float, default=0.98,
+    parser.add_argument("--keep-top", type=float, default=0.75,
                        help="Keep best X fraction of frames by reprojection error (0.9 = top 90%%)")
+    parser.add_argument("--outlier-std", type=float, default=2.5,
+                       help="Standard deviation threshold for outlier removal (default: 2.5 sigma)")
+    parser.add_argument("--iterative", action="store_true",
+                       help="Use iterative refinement to progressively remove outliers")
+    parser.add_argument("--board-x", type=float, default=None,
+                       help="Known X position of board in robot base frame (meters)")
+    parser.add_argument("--board-y", type=float, default=None,
+                       help="Known Y position of board in robot base frame (meters)")
+    parser.add_argument("--board-z", type=float, default=None,
+                       help="Known Z position of board in robot base frame (meters)")
+    parser.add_argument("--board-tolerance", type=float, default=0.050,
+                       help="Tolerance for board position filtering (meters, default: 50mm)")
+    parser.add_argument("--randomize", action="store_true",
+                       help="Randomize the order of pose images before calibration (reduces sequential bias)")
+    parser.add_argument("--random-seed", type=int, default=None,
+                       help="Random seed for reproducible randomization (use with --randomize)")
+    parser.add_argument("--max-images", type=int, default=None,
+                       help="Maximum number of images to use (random subset if --randomize)")
 
     args = parser.parse_args()
 
@@ -331,9 +450,38 @@ def main():
     print(f"  Quality filters: min_corners={args.min_charuco}, max_reproj={args.max_reproj}px, keep_top={args.keep_top*100:.0f}%")
     print()
 
-    # Find all pose pairs
-    image_files = sorted(glob.glob(os.path.join(args.poses_dir, "pose*.jpg")))
-    print(f"Found {len(image_files)} pose images")
+    # Handle multiple directories
+    poses_dirs = args.poses_dir if isinstance(args.poses_dir, list) else [args.poses_dir]
+
+    # Find all pose pairs from all directories
+    print(f"📁 Searching in {len(poses_dirs)} director{'y' if len(poses_dirs) == 1 else 'ies'}:")
+    all_image_files = []
+
+    for poses_dir in poses_dirs:
+        dir_images = sorted(glob.glob(os.path.join(poses_dir, "pose*.jpg")))
+        print(f"  {poses_dir}: found {len(dir_images)} pose images")
+        # Store images with their source directory
+        all_image_files.extend([(img, poses_dir) for img in dir_images])
+
+    print(f"\n📊 Total: {len(all_image_files)} pose images from all directories")
+
+    # Randomize order if requested
+    if args.randomize:
+        if args.random_seed is not None:
+            random.seed(args.random_seed)
+            print(f"🎲 Randomizing image order (seed={args.random_seed})...")
+        else:
+            print(f"🎲 Randomizing image order (no seed)...")
+        random.shuffle(all_image_files)
+
+    # Limit number of images if specified
+    if args.max_images is not None and args.max_images > 0:
+        all_image_files = all_image_files[:args.max_images]
+        if args.randomize:
+            print(f"Using random {len(all_image_files)} images from the dataset")
+        else:
+            print(f"Using first {len(all_image_files)} images")
+        print()
 
     # Lists to store valid calibration data
     R_gripper2base_list = []  # Robot gripper poses in base frame
@@ -345,19 +493,22 @@ def main():
 
     print("\n🔍 Processing images...")
 
-    for i, img_path in enumerate(image_files):
-        # Get corresponding .npy file
+    for i, (img_path, source_dir) in enumerate(all_image_files):
+        # Get corresponding .npy file from the same directory
         base_name = os.path.splitext(os.path.basename(img_path))[0]
-        npy_path = os.path.join(args.poses_dir, f"{base_name}.npy")
+        npy_path = os.path.join(source_dir, f"{base_name}.npy")
+
+        # Show which directory this image is from
+        dir_label = os.path.basename(source_dir)
 
         if not os.path.exists(npy_path):
-            print(f"  [{i+1}/{len(image_files)}] ⚠️  Missing pose file: {base_name}.npy")
+            print(f"  [{i+1}/{len(all_image_files)}] ⚠️  [{dir_label}] Missing pose file: {base_name}.npy")
             continue
 
         # Load image
         img = cv2.imread(img_path)
         if img is None:
-            print(f"  [{i+1}/{len(image_files)}] ❌ Failed to load image: {base_name}")
+            print(f"  [{i+1}/{len(all_image_files)}] ❌ [{dir_label}] Failed to load image: {base_name}")
             continue
 
         # Load robot pose
@@ -373,7 +524,7 @@ def main():
         )
 
         if result is None:
-            print(f"  [{i+1}/{len(image_files)}] ✗ {base_name}: {error_msg}")
+            print(f"  [{i+1}/{len(all_image_files)}] ✗ [{dir_label}] {base_name}: {error_msg}")
 
             # Show failed detection if visualizing
             if args.visualize:
@@ -400,12 +551,12 @@ def main():
         valid_pairs.append(base_name)
         frame_quality.append((reproj_err, num_corners, len(valid_pairs) - 1))
 
-        print(f"  [{i+1}/{len(image_files)}] ✓ {base_name}: {num_corners} corners, "
+        print(f"  [{i+1}/{len(all_image_files)}] ✓ [{dir_label}] {base_name}: {num_corners} corners, "
               f"reproj={reproj_err:.2f}px")
 
         # Visualize if requested (interactive mode - press key to advance)
         if args.visualize and debug_img is not None:
-            cv2.putText(debug_img, f"[{i+1}/{len(image_files)}] Press any key to continue, 'q' to skip rest",
+            cv2.putText(debug_img, f"[{i+1}/{len(all_image_files)}] Press any key to continue, 'q' to skip rest",
                        (10, debug_img.shape[0] - 10),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
             cv2.imshow("ChArUco Detection", debug_img)
@@ -414,9 +565,9 @@ def main():
                 print("  Skipping remaining visualizations...")
                 args.visualize = False  # Disable further visualization
 
-        # Save visualization if requested
+        # Save visualization if requested (save to source directory)
         if args.save_vis and debug_img is not None:
-            vis_path = os.path.join(args.poses_dir, f"vis_{base_name}.jpg")
+            vis_path = os.path.join(source_dir, f"vis_{base_name}.jpg")
             cv2.imwrite(vis_path, debug_img)
 
     if args.visualize:
@@ -432,11 +583,23 @@ def main():
     print("\n🔍 Applying quality filtering...")
     print(f"  Initial frames: {len(frame_quality)}")
 
-    # Filter by max reprojection error and min corner count
+    # Step 1: Filter by max reprojection error and min corner count
     keep_idx = [i for err, ncorners, i in frame_quality
                 if err <= args.max_reproj and ncorners >= args.min_charuco]
 
-    # Sort by reprojection error (lower is better) and keep top percentage
+    # Step 2: Adaptive reprojection error filtering - use median + MAD for robust threshold
+    if keep_idx:
+        reproj_errors = np.array([frame_quality[i][0] for i in keep_idx])
+        median_err = np.median(reproj_errors)
+        mad_err = np.median(np.abs(reproj_errors - median_err))
+        robust_threshold = median_err + 2.5 * mad_err * 1.4826  # 2.5 sigma in MAD units
+
+        # Further filter by adaptive threshold (but keep at least what user specified)
+        adaptive_threshold = min(robust_threshold, args.max_reproj)
+        keep_idx = [i for i in keep_idx if frame_quality[i][0] <= adaptive_threshold]
+        print(f"  Adaptive reproj threshold: {adaptive_threshold:.3f}px (median: {median_err:.3f}px)")
+
+    # Step 3: Sort by reprojection error (lower is better) and keep top percentage
     quality_sorted = [(frame_quality[i][0], frame_quality[i][1], i) for i in keep_idx]
     quality_sorted.sort(key=lambda x: (x[0], -x[1]))  # Sort by error asc, corners desc
 
@@ -458,7 +621,7 @@ def main():
 
     removed_count = len(valid_pairs) - len(valid_pairs_filtered)
     if removed_count > 0:
-        print(f"  Removed {removed_count} low-quality frames")
+        print(f"  Removed {removed_count} low-quality frames (reprojection error)")
         print(f"  Kept {len(valid_pairs_filtered)} high-quality frames for calibration")
         # Show quality stats
         kept_quality = [frame_quality[i] for i in keep_idx]
@@ -523,6 +686,157 @@ def main():
     print(f"\nCamera-to-Gripper Transformation:")
     print(f"  Translation (m): {selected_result['t_cam2gripper']}")
     print(f"  Rotation matrix:\n{selected_result['R_cam2gripper']}")
+
+    # Filter by known board position if provided
+    if args.board_x is not None or args.board_y is not None or args.board_z is not None:
+        print(f"\n📍 Filtering by known board position...")
+
+        # Build known position vector (None for unknown axes)
+        known_pos = np.array([args.board_x, args.board_y, args.board_z], dtype=object)
+
+        # Display what we're filtering by
+        filter_axes = []
+        if args.board_x is not None:
+            filter_axes.append(f"X={args.board_x:.4f}m")
+        if args.board_y is not None:
+            filter_axes.append(f"Y={args.board_y:.4f}m")
+        if args.board_z is not None:
+            filter_axes.append(f"Z={args.board_z:.4f}m")
+        print(f"  Known position: {', '.join(filter_axes)}")
+        print(f"  Tolerance: ±{args.board_tolerance*1000:.1f}mm")
+
+        # Filter samples
+        inlier_idx, _, deviations = filter_by_known_board_position(
+            R_gripper2base_list, t_gripper2base_list,
+            R_target2cam_list, t_target2cam_list,
+            selected_result['T_cam2gripper'], known_pos, args.board_tolerance
+        )
+
+        outlier_count = len(valid_pairs_filtered) - len(inlier_idx)
+
+        if outlier_count > 0:
+            print(f"  Removed {outlier_count} samples outside tolerance")
+
+            # Show statistics for filtered axes
+            for axis_idx, axis_name in enumerate(['X', 'Y', 'Z']):
+                if known_pos[axis_idx] is not None:
+                    axis_devs = deviations[:, axis_idx] * 1000  # Convert to mm
+                    kept_devs = deviations[inlier_idx, axis_idx] * 1000
+                    print(f"  {axis_name} deviation: mean={np.mean(kept_devs):.1f}mm, "
+                          f"max={np.max(kept_devs):.1f}mm, "
+                          f"removed_max={np.max(axis_devs):.1f}mm")
+
+            # Keep only inliers
+            R_gripper2base_list = [R_gripper2base_list[i] for i in inlier_idx]
+            t_gripper2base_list = [t_gripper2base_list[i] for i in inlier_idx]
+            R_target2cam_list = [R_target2cam_list[i] for i in inlier_idx]
+            t_target2cam_list = [t_target2cam_list[i] for i in inlier_idx]
+            valid_pairs_filtered = [valid_pairs_filtered[i] for i in inlier_idx]
+
+            if len(valid_pairs_filtered) < 3:
+                print(f"❌ After position filtering, only {len(valid_pairs_filtered)} samples remain (need at least 3)")
+                print(f"   Try increasing --board-tolerance or check your board position values")
+                return
+
+            # Re-calibrate with position-filtered data
+            print(f"  Re-calibrating with {len(valid_pairs_filtered)} position-filtered samples...")
+
+            Rg_filt = [R for R in R_gripper2base_list]
+            tg_filt = [t.reshape(3, 1) for t in t_gripper2base_list]
+            Rt_filt = [R for R in R_target2cam_list]
+            tt_filt = [t.reshape(3, 1) for t in t_target2cam_list]
+
+            try:
+                R_cam2gripper_filt, t_cam2gripper_filt = cv2.calibrateHandEye(
+                    R_gripper2base=Rg_filt,
+                    t_gripper2base=tg_filt,
+                    R_target2cam=Rt_filt,
+                    t_target2cam=tt_filt,
+                    method=cv2.CALIB_HAND_EYE_PARK if selected_method == "PARK" else cv2.CALIB_HAND_EYE_TSAI
+                )
+
+                # Update results
+                selected_result['R_cam2gripper'] = R_cam2gripper_filt
+                selected_result['t_cam2gripper'] = t_cam2gripper_filt.flatten()
+                selected_result['T_cam2gripper'] = to_homogeneous(R_cam2gripper_filt, t_cam2gripper_filt.flatten())
+
+                print(f"  ✓ Updated translation (m): {selected_result['t_cam2gripper']}")
+
+            except Exception as e:
+                print(f"  ⚠️  Re-calibration failed: {e}, keeping original calibration")
+        else:
+            print(f"  ✓ All {len(valid_pairs_filtered)} samples are within tolerance")
+
+    # Iterative outlier removal based on board position consistency
+    if args.iterative and len(valid_pairs_filtered) > 10:
+        print(f"\n🔄 Iterative refinement enabled...")
+
+        current_R_gb = R_gripper2base_list.copy()
+        current_t_gb = t_gripper2base_list.copy()
+        current_R_tc = R_target2cam_list.copy()
+        current_t_tc = t_target2cam_list.copy()
+        current_pairs = valid_pairs_filtered.copy()
+
+        for iteration in range(3):  # Max 3 iterations
+            # Detect outliers based on board position
+            inlier_idx, _, _, robust_std = detect_outliers_by_board_position(
+                current_R_gb, current_t_gb, current_R_tc, current_t_tc,
+                selected_result['T_cam2gripper'], args.outlier_std
+            )
+
+            outlier_count = len(current_pairs) - len(inlier_idx)
+
+            if outlier_count == 0:
+                print(f"  Iteration {iteration + 1}: No outliers detected, stopping")
+                break
+
+            print(f"  Iteration {iteration + 1}: Removed {outlier_count} outliers "
+                  f"(threshold: {args.outlier_std * robust_std * 1000:.1f}mm)")
+
+            # Keep only inliers
+            current_R_gb = [current_R_gb[i] for i in inlier_idx]
+            current_t_gb = [current_t_gb[i] for i in inlier_idx]
+            current_R_tc = [current_R_tc[i] for i in inlier_idx]
+            current_t_tc = [current_t_tc[i] for i in inlier_idx]
+            current_pairs = [current_pairs[i] for i in inlier_idx]
+
+            if len(current_pairs) < 3:
+                print(f"  ⚠️  Too few samples remaining ({len(current_pairs)}), using previous iteration")
+                break
+
+            # Re-calibrate with filtered data
+            Rg_iter = [R for R in current_R_gb]
+            tg_iter = [t.reshape(3, 1) for t in current_t_gb]
+            Rt_iter = [R for R in current_R_tc]
+            tt_iter = [t.reshape(3, 1) for t in current_t_tc]
+
+            try:
+                R_cam2gripper_iter, t_cam2gripper_iter = cv2.calibrateHandEye(
+                    R_gripper2base=Rg_iter,
+                    t_gripper2base=tg_iter,
+                    R_target2cam=Rt_iter,
+                    t_target2cam=tt_iter,
+                    method=cv2.CALIB_HAND_EYE_PARK if selected_method == "PARK" else cv2.CALIB_HAND_EYE_TSAI
+                )
+
+                # Update results
+                selected_result['R_cam2gripper'] = R_cam2gripper_iter
+                selected_result['t_cam2gripper'] = t_cam2gripper_iter.flatten()
+                selected_result['T_cam2gripper'] = to_homogeneous(R_cam2gripper_iter, t_cam2gripper_iter.flatten())
+
+            except Exception as e:
+                print(f"  ⚠️  Iteration {iteration + 1} calibration failed: {e}")
+                break
+
+        # Update the lists for final results
+        R_gripper2base_list = current_R_gb
+        t_gripper2base_list = current_t_gb
+        R_target2cam_list = current_R_tc
+        t_target2cam_list = current_t_tc
+        valid_pairs_filtered = current_pairs
+
+        print(f"  Final sample count: {len(valid_pairs_filtered)}")
+        print(f"  Refined translation (m): {selected_result['t_cam2gripper']}")
 
     def _to_T(R: np.ndarray, t: np.ndarray) -> np.ndarray:
         T = np.eye(4, dtype=np.float64)

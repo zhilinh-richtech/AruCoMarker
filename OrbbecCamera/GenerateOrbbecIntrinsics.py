@@ -13,6 +13,7 @@ import os
 import glob
 from datetime import datetime
 import argparse
+import random
 
 # ChArUco board parameters (should match the ones used in EyeInHand.py)
 CHARUCO_SQUARES_X = 5       # columns (X across)
@@ -22,10 +23,17 @@ MARKER_LEN_M = SQUARE_LEN_M * 0.8       # marker side length in meters
 ARUCO_DICT_ID = cv2.aruco.DICT_4X4_250  # ArUco dictionary
 
 class OrbbecIntrinsicsGenerator:
-    def __init__(self, images_dir="./calib_intrinsics_images", max_images=None, visualize_refinement=False):
-        self.images_dir = images_dir
+    def __init__(self, images_dirs=None, max_images=None, visualize_refinement=False, randomize=False, random_seed=None):
+        # Support both single directory (string) and multiple directories (list)
+        if images_dirs is None:
+            images_dirs = ["./calib_intrinsics_images"]
+        elif isinstance(images_dirs, str):
+            images_dirs = [images_dirs]
+        self.images_dirs = images_dirs
         self.max_images = max_images
         self.visualize_refinement = visualize_refinement
+        self.randomize = randomize
+        self.random_seed = random_seed
         self.camera_matrix = None
         self.dist_coeffs = None
         self.calibration_flags = 0
@@ -104,25 +112,50 @@ class OrbbecIntrinsicsGenerator:
         return None
     
     def load_images(self):
-        """Load captured images"""
-        image_files = glob.glob(os.path.join(self.images_dir, "*.jpg"))
-        image_files.sort()  # Sort to ensure consistent order
+        """Load captured images from one or more directories"""
+        # Collect images from all directories
+        all_image_files = []
 
-        print(f"Found {len(image_files)} images in {self.images_dir}")
+        print(f"📁 Searching in {len(self.images_dirs)} director{'y' if len(self.images_dirs) == 1 else 'ies'}:")
+        for img_dir in self.images_dirs:
+            dir_files = glob.glob(os.path.join(img_dir, "*.jpg"))
+            dir_files.extend(glob.glob(os.path.join(img_dir, "*.png")))  # Also support PNG
+            print(f"  {img_dir}: found {len(dir_files)} images")
+            all_image_files.extend(dir_files)
+
+        all_image_files.sort()  # Sort to ensure consistent order
+
+        print(f"\n📊 Total: {len(all_image_files)} images from all directories")
+
+        # Randomize order if requested
+        if self.randomize:
+            if self.random_seed is not None:
+                random.seed(self.random_seed)
+                print(f"🎲 Randomizing image order (seed={self.random_seed})...")
+            else:
+                print(f"🎲 Randomizing image order (no seed)...")
+            random.shuffle(all_image_files)
 
         # Limit number of images if specified
         if self.max_images is not None and self.max_images > 0:
-            image_files = image_files[:self.max_images]
-            print(f"Using first {len(image_files)} images")
+            all_image_files = all_image_files[:self.max_images]
+            if self.randomize:
+                print(f"Using random {len(all_image_files)} images from the dataset")
+            else:
+                print(f"Using first {len(all_image_files)} images")
 
+        print(f"\n📸 Loading images...")
         images = []
-        for img_file in image_files:
+        for img_file in all_image_files:
             img = cv2.imread(img_file)
             if img is not None:
                 images.append(img)
-                print(f"  Loaded: {os.path.basename(img_file)} ({img.shape})")
+                # Show directory name and filename for clarity
+                dir_name = os.path.basename(os.path.dirname(img_file))
+                file_name = os.path.basename(img_file)
+                print(f"  [{dir_name}] {file_name} ({img.shape[1]}x{img.shape[0]})")
             else:
-                print(f"  Failed to load: {img_file}")
+                print(f"  ❌ Failed to load: {img_file}")
 
         return images
     
@@ -211,7 +244,6 @@ class OrbbecIntrinsicsGenerator:
 
         try:
             # Initial calibration
-            flags = cv2.CALIB_FIX_K3 | cv2.CALIB_ZERO_TANGENT_DIST
             print("\n  Phase 1: Initial calibration...")
             ret, K, D, rvecs, tvecs = cv2.aruco.calibrateCameraCharuco(
                 charucoCorners=all_corners,
@@ -219,8 +251,7 @@ class OrbbecIntrinsicsGenerator:
                 board=board,
                 imageSize=imsize,
                 cameraMatrix=None,
-                distCoeffs=None,
-                flags = flags
+                distCoeffs=None
             )
 
             print(f"  Initial RMS error: {ret:.4f}")
@@ -393,7 +424,6 @@ class OrbbecIntrinsicsGenerator:
 
                     # Store previous calibration for potential early stop
                     prev_ret, prevK, prevD = ret, K.copy(), D.copy()
-                    flags = cv2.CALIB_FIX_K3 | cv2.CALIB_ZERO_TANGENT_DIST | cv2.CALIB_USE_INTRINSIC_GUESS
                     # Re-optimize with intrinsic guess (keeps solution close to previous, which we used for re-distortion)
                     ret, K, D, rvecs, tvecs = cv2.aruco.calibrateCameraCharuco(
                         charucoCorners=refined_corners,
@@ -644,16 +674,24 @@ class OrbbecIntrinsicsGenerator:
 
 def main():
     parser = argparse.ArgumentParser(description="Generate Orbbec camera intrinsics from captured images")
-    parser.add_argument("--images-dir", default="./new_intriniscs_image/",
-                        help="Directory containing captured images")
+    parser.add_argument("--images-dir", nargs='+', default=["./new_intriniscs_image/"],
+                        help="One or more directories containing captured images (space-separated)")
     parser.add_argument("--max-images", type=int, default=None,
                         help="Maximum number of images to use (uses first N images in sorted order)")
     parser.add_argument("--visualize-refinement", action="store_true",
                         help="Save visualization images comparing original and refined corners")
+    parser.add_argument("--randomize", action="store_true",
+                        help="Randomize the order of images before calibration (reduces sequential bias)")
+    parser.add_argument("--random-seed", type=int, default=None,
+                        help="Random seed for reproducible randomization (use with --randomize)")
     args = parser.parse_args()
 
-    generator = OrbbecIntrinsicsGenerator(args.images_dir, max_images=args.max_images,
-                                         visualize_refinement=args.visualize_refinement)
+    # Convert to list if needed (nargs='+' already returns a list)
+    images_dirs = args.images_dir if isinstance(args.images_dir, list) else [args.images_dir]
+
+    generator = OrbbecIntrinsicsGenerator(images_dirs=images_dirs, max_images=args.max_images,
+                                         visualize_refinement=args.visualize_refinement,
+                                         randomize=args.randomize, random_seed=args.random_seed)
     success = generator.run()
     
     if success:

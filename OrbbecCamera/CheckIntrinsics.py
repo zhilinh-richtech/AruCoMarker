@@ -372,9 +372,9 @@ def interactive_viewer(images, camera_matrix, dist_coeffs, board_params=None):
 
 def main():
     parser = argparse.ArgumentParser(description="Check camera intrinsics by visualizing undistortion")
-    parser.add_argument("--calibration", default="../output/orbbec_calibration_20251003_112009.npz",
+    parser.add_argument("--calibration", default="../output/orbbec_calibration_20251005_163544.npz",
                        help="Path to calibration file (default: ../output/orbbec_calibration.npz)")
-    parser.add_argument("--images", default="./new_intriniscs_image/",
+    parser.add_argument("--images", default="./test_intrinsics_image/",
                        help="Directory containing images (default: ./new_intriniscs_image/)")
     parser.add_argument("--image-id", type=int, default=20,
                        help="Image ID to display (default: 20)")
