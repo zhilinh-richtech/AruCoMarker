@@ -387,9 +387,9 @@ def filter_by_known_board_position(R_gripper2base_list, t_gripper2base_list,
 
 def main():
     parser = argparse.ArgumentParser(description="Eye-in-hand calibration from pre-captured poses")
-    parser.add_argument("--poses-dir", nargs='+', default=["./new_poses_folder"],
+    parser.add_argument("--poses-dir", nargs='+', default=["./testing_poses"],
                        help="One or more directories containing pose images and .npy files (space-separated)")
-    parser.add_argument("--calibration", default="../output/orbbec_calibration_20251003_112009.json",
+    parser.add_argument("--calibration", default="../output/allimage_calibration.json",
                        help="Camera calibration file (.npz or .json)")
     parser.add_argument("--output", default="./calibrate_result/EyeInHand.npz",
                        help="Output file for hand-eye calibration result")
@@ -413,7 +413,7 @@ def main():
                        help="Known Y position of board in robot base frame (meters)")
     parser.add_argument("--board-z", type=float, default=None,
                        help="Known Z position of board in robot base frame (meters)")
-    parser.add_argument("--board-tolerance", type=float, default=0.050,
+    parser.add_argument("--board-tolerance", type=float, default=0.001,
                        help="Tolerance for board position filtering (meters, default: 50mm)")
     parser.add_argument("--randomize", action="store_true",
                        help="Randomize the order of pose images before calibration (reduces sequential bias)")
@@ -579,59 +579,9 @@ def main():
         print("❌ Not enough valid pose pairs for calibration (need at least 3)")
         return
 
-    # Apply quality filtering to keep only the best frames
-    print("\n🔍 Applying quality filtering...")
-    print(f"  Initial frames: {len(frame_quality)}")
-
-    # Step 1: Filter by max reprojection error and min corner count
-    keep_idx = [i for err, ncorners, i in frame_quality
-                if err <= args.max_reproj and ncorners >= args.min_charuco]
-
-    # Step 2: Adaptive reprojection error filtering - use median + MAD for robust threshold
-    if keep_idx:
-        reproj_errors = np.array([frame_quality[i][0] for i in keep_idx])
-        median_err = np.median(reproj_errors)
-        mad_err = np.median(np.abs(reproj_errors - median_err))
-        robust_threshold = median_err + 2.5 * mad_err * 1.4826  # 2.5 sigma in MAD units
-
-        # Further filter by adaptive threshold (but keep at least what user specified)
-        adaptive_threshold = min(robust_threshold, args.max_reproj)
-        keep_idx = [i for i in keep_idx if frame_quality[i][0] <= adaptive_threshold]
-        print(f"  Adaptive reproj threshold: {adaptive_threshold:.3f}px (median: {median_err:.3f}px)")
-
-    # Step 3: Sort by reprojection error (lower is better) and keep top percentage
-    quality_sorted = [(frame_quality[i][0], frame_quality[i][1], i) for i in keep_idx]
-    quality_sorted.sort(key=lambda x: (x[0], -x[1]))  # Sort by error asc, corners desc
-
-    keep_count = max(3, int(args.keep_top * len(quality_sorted)))
-    keep_idx = [idx for _, _, idx in quality_sorted[:keep_count]]
-    keep_idx.sort()  # Restore original order
-
-    if len(keep_idx) < 3:
-        print(f"❌ After quality filtering, only {len(keep_idx)} frames remain (need at least 3)")
-        print(f"   Try relaxing --max-reproj, --min-charuco, or --keep-top parameters")
-        return
-
-    # Filter all lists
-    R_gripper2base_list = [R_gripper2base_list[i] for i in keep_idx]
-    t_gripper2base_list = [t_gripper2base_list[i] for i in keep_idx]
-    R_target2cam_list = [R_target2cam_list[i] for i in keep_idx]
-    t_target2cam_list = [t_target2cam_list[i] for i in keep_idx]
-    valid_pairs_filtered = [valid_pairs[i] for i in keep_idx]
-
-    removed_count = len(valid_pairs) - len(valid_pairs_filtered)
-    if removed_count > 0:
-        print(f"  Removed {removed_count} low-quality frames (reprojection error)")
-        print(f"  Kept {len(valid_pairs_filtered)} high-quality frames for calibration")
-        # Show quality stats
-        kept_quality = [frame_quality[i] for i in keep_idx]
-        reproj_errs = [err for err, _, _ in kept_quality]
-        corner_counts = [nc for _, nc, _ in kept_quality]
-        print(f"  Reproj error range: {min(reproj_errs):.2f} - {max(reproj_errs):.2f}px (median: {np.median(reproj_errs):.2f}px)")
-        print(f"  Corner count range: {min(corner_counts)} - {max(corner_counts)} (median: {int(np.median(corner_counts))})")
-    else:
-        print(f"  All frames passed quality filter")
-        valid_pairs_filtered = valid_pairs
+    # Skip quality filtering - use all valid frames
+    print(f"\n✓ Using all {len(valid_pairs)} valid frames for calibration (no quality filtering)")
+    valid_pairs_filtered = valid_pairs
 
     # Prepare data for calibrateHandEye
     print("\n🎯 Performing hand-eye calibration...")

@@ -1,0 +1,5 @@
+testing_poses/pose013.jpg
+testing_poses/pose007.jpg
+testing_poses/pose001.jpg
+testing_poses/pose003.jpg
+testing_poses/pose008.jpg
