@@ -28,8 +28,26 @@ def load_calibration_data(calibration_file: str) -> Tuple[np.ndarray, np.ndarray
         # Load from JSON file
         with open(calibration_file, 'r') as f:
             data = json.load(f)
-        camera_matrix = np.array(data['camera_matrix'])
-        dist_coeffs = np.array(data['distortion_coefficients'])
+
+        # Check if it's the standard format
+        if 'camera_matrix' in data:
+            camera_matrix = np.array(data['camera_matrix'])
+            dist_coeffs = np.array(data['distortion_coefficients'])
+        # Check if it's the Orbbec format (nested with camera name)
+        elif len(data) == 1:
+            # Get the first (and only) key
+            camera_name = list(data.keys())[0]
+            cam_data = data[camera_name]
+
+            # Build camera matrix from fx, fy, cx, cy
+            camera_matrix = np.array([
+                [cam_data['fx'], 0, cam_data['cx']],
+                [0, cam_data['fy'], cam_data['cy']],
+                [0, 0, 1]
+            ])
+            dist_coeffs = np.array(cam_data['distortion']).reshape(1, -1)
+        else:
+            raise ValueError("Unrecognized JSON format. Expected 'camera_matrix' or Orbbec format with fx/fy/cx/cy")
     else:
         raise ValueError(f"Unsupported file format: {file_path.suffix}. Use .json or .npz")
 
@@ -704,7 +722,7 @@ def main():
                        help='Type of calibration pattern (chessboard or charuco)')
     parser.add_argument('--pattern-size', nargs=2, type=int, default=[5, 7],
                        help='For chessboard: inner corners (width height). For charuco: board squares (width height)')
-    parser.add_argument('--square-size', type=float, default=0.037,
+    parser.add_argument('--square-size', type=float, default=0.03718,
                        help='Size of squares in calibration pattern (meters)')
     parser.add_argument('--marker-size', type=float, default=None,
                        help='Size of ArUco markers (meters). Defaults to 0.8 * square_size. Only for charuco.')

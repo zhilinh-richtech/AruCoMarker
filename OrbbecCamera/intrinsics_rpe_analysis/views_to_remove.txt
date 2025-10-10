@@ -1,8 +1,0 @@
-# Top 5 worst views to remove from calibration
-# These views have severe outliers (>3σ) and high RMS errors
-
-testing_poses/pose022.jpg
-testing_poses/pose021.jpg
-testing_poses/pose018.jpg
-testing_poses/pose020.jpg
-testing_poses/pose019.jpg

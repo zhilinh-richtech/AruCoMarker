@@ -21,12 +21,12 @@ from typing import Optional, Tuple, Dict, Any
 from scipy.spatial.transform import Rotation as Rsc
 
 
-# ChArUco board parameters (must match your physical board!)
-CHARUCO_SQUARES_X = 5       # columns (X across)
-CHARUCO_SQUARES_Y = 7       # rows    (Y down)
-SQUARE_LEN_M = 0.037      # square side length in meters
-MARKER_LEN_M = SQUARE_LEN_M * 0.8  # marker side length in meters
-ARUCO_DICT_ID = cv2.aruco.DICT_4X4_250
+# ChArUco board parameters (should match the ones used in EyeInHand.py)
+CHARUCO_SQUARES_X = 14       # columns (X across)
+CHARUCO_SQUARES_Y = 9       # rows    (Y down)
+SQUARE_LEN_M = 0.040        # square side length in meters
+MARKER_LEN_M = 0.030       # marker side length in meters
+ARUCO_DICT_ID = cv2.aruco.DICT_5X5_1000  # ArUco dictionary
 
 
 def load_calibration(calib_path: str) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Dict]:
@@ -101,10 +101,8 @@ def make_aruco_detector():
     """Create modern ArucoDetector with optimized parameters for accuracy"""
     aruco_dict = cv2.aruco.getPredefinedDictionary(ARUCO_DICT_ID)
     params = cv2.aruco.DetectorParameters()
-    params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
-    params.cornerRefinementWinSize = 5
-    params.cornerRefinementMaxIterations = 50
-    params.cornerRefinementMinAccuracy = 0.01
+    # No corner refinement for ChArUco - refining marker corners hurts ChArUco interpolation
+    params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_NONE
     params.adaptiveThreshWinSizeMin = 5
     params.adaptiveThreshWinSizeMax = 23
     params.adaptiveThreshWinSizeStep = 4
@@ -391,7 +389,7 @@ def main():
                        help="One or more directories containing pose images and .npy files (space-separated)")
     parser.add_argument("--calibration", default="../output/allimage_calibration.json",
                        help="Camera calibration file (.npz or .json)")
-    parser.add_argument("--output", default="./calibrate_result/EyeInHand.npz",
+    parser.add_argument("--output", default="./new_board_calibrate_result/EyeInHand.npz",
                        help="Output file for hand-eye calibration result")
     parser.add_argument("--visualize", action="store_true",
                        help="Show visualization of detected boards")

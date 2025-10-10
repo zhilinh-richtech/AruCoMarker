@@ -16,11 +16,11 @@ import argparse
 import random
 
 # ChArUco board parameters (should match the ones used in EyeInHand.py)
-CHARUCO_SQUARES_X = 5       # columns (X across)
-CHARUCO_SQUARES_Y = 7       # rows    (Y down)
-SQUARE_LEN_M = 0.037        # square side length in meters
-MARKER_LEN_M = SQUARE_LEN_M * 0.8       # marker side length in meters
-ARUCO_DICT_ID = cv2.aruco.DICT_4X4_250  # ArUco dictionary
+CHARUCO_SQUARES_X = 14       # columns (X across)
+CHARUCO_SQUARES_Y = 9       # rows    (Y down)
+SQUARE_LEN_M = 0.040        # square side length in meters
+MARKER_LEN_M = 0.030       # marker side length in meters
+ARUCO_DICT_ID = cv2.aruco.DICT_5X5_1000  # ArUco dictionary
 
 class OrbbecIntrinsicsGenerator:
     def __init__(self, images_dirs=None, max_images=None, visualize_refinement=False, randomize=False, random_seed=None):
@@ -40,6 +40,19 @@ class OrbbecIntrinsicsGenerator:
         self.reprojection_error = None
         self.image_width = None
         self.image_height = None
+
+    def _restrict_to_k1_k2_p1(self, D: np.ndarray) -> np.ndarray:
+        """
+        Return a distortion vector that only keeps k1, k2, and p1.
+        All other coefficients (p2, k3, k4, k5, k6, etc.) are set to zero.
+        The returned vector shape is (5, 1): [k1, k2, p1, 0, 0]^T.
+        """
+        d = np.ravel(D).astype(np.float64)
+        k1 = d[0] if len(d) > 0 else 0.0
+        k2 = d[1] if len(d) > 1 else 0.0
+        p1 = d[2] if len(d) > 2 else 0.0
+        D_simple = np.array([k1, k2, p1, 0.0, 0.0], dtype=np.float64).reshape(-1, 1)
+        return D_simple
 
     @staticmethod
     def forward_distort_points(pts_ud_px, K, D):
@@ -449,7 +462,8 @@ class OrbbecIntrinsicsGenerator:
                     print(f"  Iteration {iteration+1}: No corners refined, keeping previous calibration")
 
             self.camera_matrix = K
-            self.dist_coeffs = D
+            # Enforce simpler distortion: keep only k1, k2, p1
+            self.dist_coeffs = self._restrict_to_k1_k2_p1(D)
             self.reprojection_error = ret
 
             print("✓ Camera calibration with iterative refinement successful!")

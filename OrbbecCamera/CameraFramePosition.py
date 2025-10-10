@@ -389,7 +389,7 @@ def main():
     parser.add_argument(
         '--intrinsics',
         type=str,
-        default='./gemini_intrinsics/gemini_355_rgb_intrinsics_20250930_181519.json',
+        default='../output/allimage_calibration.json',
         help='Path to camera intrinsics JSON file'
     )
     parser.add_argument(

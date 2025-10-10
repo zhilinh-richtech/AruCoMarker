@@ -29,12 +29,12 @@ from pyorbbecsdk import Pipeline, Context, Config, OBStreamType, OBFormat, OBSen
 
 
 # Default marker parameters
-CHARUCO_SQUARES_X = 5       # columns (X across)
-CHARUCO_SQUARES_Y = 7       # rows    (Y down)
-SQUARE_LEN_M = 0.037      # square side length in meters
-MARKER_LEN_M = SQUARE_LEN_M * 0.80  # marker side length in meters (80% of square)
-ARUCO_SIZE_M = 0.0500         # single ArUco marker size in meters
-ARUCO_DICT_ID = cv2.aruco.DICT_4X4_250
+CHARUCO_SQUARES_X = 14       # columns (X across)
+CHARUCO_SQUARES_Y = 9      # rows    (Y down)
+SQUARE_LEN_M = 0.040      # square side length in meters
+MARKER_LEN_M = 0.030  # marker side length in meters (80% of square)
+ARUCO_SIZE_M = 0.030         # single ArUco marker size in meters
+ARUCO_DICT_ID = cv2.aruco.DICT_5X5_1000
 
 # Robot and camera settings
 XARM_IP = "192.168.10.202"
@@ -144,12 +144,10 @@ def make_charuco_board():
 
 
 def default_detector_params():
-    """Create detector parameters optimized for accuracy"""
+    """Create detector parameters optimized for ChArUco detection"""
     p = cv2.aruco.DetectorParameters()
-    p.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
-    p.cornerRefinementWinSize = 5
-    p.cornerRefinementMaxIterations = 50
-    p.cornerRefinementMinAccuracy = 0.0100
+    # No corner refinement for ChArUco - refining marker corners hurts ChArUco interpolation
+    p.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_NONE
     return p
 
 
@@ -507,10 +505,12 @@ def visualize_result(image: np.ndarray, pose_result: Dict, K: np.ndarray, D: np.
 
 def main():
     parser = argparse.ArgumentParser(description="Check eye-in-hand calibration")
-    parser.add_argument("--calibration", default="./calibrate_result/EyeInHand.npz",
+    parser.add_argument("--calibration", default="./new_board_calibrate_result/EyeInHand.npz",
                        help="Eye-in-hand calibration file")
-    parser.add_argument("--intrinsics", type=str, default=None,
+    parser.add_argument("--intrinsics", type=str, default="./gemini_intrinsics/gemini_355_rgb_intrinsics_20250930_181519.json",
                        help="Camera intrinsics file (.npz or .json) if not included in calibration file")
+    parser.add_argument("--test-extrinsics", type=str, default=None,
+                       help="Path to .npy file containing 4x4 camera-to-gripper transformation matrix to test")
     parser.add_argument("--xarm-ip", default=XARM_IP,
                        help="xArm IP address")
     parser.add_argument("--camera-kind", default="orbbec",
@@ -552,14 +552,30 @@ def main():
 
     # Collect extrinsics to evaluate: selected plus any others available
     extrinsics_list = []
-    extrinsics_list.append((calib.get('selected_method', 'selected'), calib['T_cam2gripper']))
-    if 'all_methods' in calib:
+
+    # If test extrinsics provided, use that instead
+    if args.test_extrinsics is not None:
         try:
-            for name, res in calib['all_methods'].items():
-                if isinstance(res, dict) and 'T_cam2gripper' in res:
-                    extrinsics_list.append((name, res['T_cam2gripper']))
-        except Exception:
-            pass
+            test_T_cam2gripper = np.load(args.test_extrinsics)
+            if test_T_cam2gripper.shape != (4, 4):
+                print(f"❌ Test extrinsics must be 4x4, got {test_T_cam2gripper.shape}")
+                return
+            extrinsics_list.append(('TEST_EXTRINSICS', test_T_cam2gripper))
+            print(f"✓ Loaded test extrinsics from: {args.test_extrinsics}")
+            print(f"  T_cam2gripper:\n{test_T_cam2gripper}")
+        except Exception as e:
+            print(f"❌ Failed to load test extrinsics: {e}")
+            return
+    else:
+        # Use calibration file extrinsics
+        extrinsics_list.append((calib.get('selected_method', 'selected'), calib['T_cam2gripper']))
+        if 'all_methods' in calib:
+            try:
+                for name, res in calib['all_methods'].items():
+                    if isinstance(res, dict) and 'T_cam2gripper' in res:
+                        extrinsics_list.append((name, res['T_cam2gripper']))
+            except Exception:
+                pass
 
     # Create ArUco dictionary and board based on mode
     aruco_dict = cv2.aruco.getPredefinedDictionary(ARUCO_DICT_ID)
