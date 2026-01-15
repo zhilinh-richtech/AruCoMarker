@@ -1,0 +1,18 @@
+{
+  "orbbec_gemini_355_rgb": {
+    "fx": 1037.11,
+    "fy": 1037.06,
+    "cx": 964.81,
+    "cy": 543.77,
+    "width": 1920,
+    "height": 1080,
+    "distortion": [
+      0.01769107,
+      -0.06858128,
+      0.00075669,
+      -0.0,
+      0.0
+    ],
+    "description": "Orbbec Gemini 355 RGB intrinsics - Auto-extracted (1920x1080)"
+  }
+}

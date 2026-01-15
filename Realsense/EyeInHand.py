@@ -1,378 +1,740 @@
 #!/usr/bin/env python3
+import argparse
 import os
+import select
+import shutil
 import sys
-import signal
-from typing import Tuple
+import termios
+import time
+import tty
 
 import cv2
 import numpy as np
+from scipy.spatial.transform import Rotation as R
+
+from camera import create_camera
 import pyrealsense2 as rs
+from terminal_display import Display, draw_axes_ascii_friendly
+from utils import (
+    invert_rt,
+    rel_motion,
+    rot_angle_deg,
+    rpy_to_matrix,
+    to_cv_lists,
+    to_homogeneous,
+)
 from xarm.wrapper import XArmAPI
 
 # =========================
-# Config
+# CONFIG
 # =========================
-XARM_IP = '192.168.10.201'
+XARM_IP = "192.168.10.22"
+USE_DEG = True
 
-# Use a supported RGB mode (D455/D457 typical: 1280x720 or 1920x1080)
-REALSENSE_WIDTH  = 1280
-REALSENSE_HEIGHT = 720
-REALSENSE_FPS    = 30
+REALSENSE_WIDTH = 1280
+REALSENSE_HEIGHT = 800
+REALSENSE_FPS = 30
 
-# ChArUco board (update to match your print!)
-ARUCO_DICT_ID = cv2.aruco.DICT_4X4_250
-CHARUCO_SQUARES_X = 5
-CHARUCO_SQUARES_Y = 7
-CHARUCO_SQUARE_LEN_M = 0.034
-CHARUCO_MARKER_LEN_M = 0.78 * CHARUCO_SQUARE_LEN_M
+# calib.io ChArUco board (you said: rows=4, columns=6)
+CHARUCO_SQUARES_X = 5       # columns (X across)
+CHARUCO_SQUARES_Y = 7       # rows    (Y down)
+SQUARE_LEN_M      = 0.034  # measure your printed square side (meters)
+MARKER_LEN_RATIO  = 0.81     # calib.io default unless you changed it
+MARKER_LEN_M      = MARKER_LEN_RATIO * SQUARE_LEN_M  # measure your printed marker side (meters)
+MARKER_LEN_M      = 0.0274
+# If you KNOW these, set them; otherwise leave None to auto-lock from the image
+ARUCO_DICT_ID    = None     # e.g. cv2.aruco.DICT_4X4_250
+FIRST_MARKER_ID  = None     # e.g. 17
 
-AXIS_LEN_M = 0.05
-SAVE_DIR = 'output_left'
-SAMPLE_PATH = os.path.join(SAVE_DIR, 'handeye_samples.npz')
-OUT_CALIB_PATH = os.path.join(SAVE_DIR, 'eye_to_hand_calibration.npz')
-SAVED_INTR_PATH = "../output/realsense_calibration.npz"
+# Capture gating (encourage diverse robot poses)
+MIN_ANGLE_DEG    = 8.0
+MIN_TRANS_M      = 0.03
+MIN_SAMPLES      = 3
+TARGET_SAMPLES   = 20
 
-# Disable OpenCL on Jetson to avoid random crashes in some builds
-try:
-    cv2.ocl.setUseOpenCL(False)
-except Exception:
-    pass
+AXIS_LEN_M       = 0.08
+SAVE_DIR         = "../output/poses"  # Directory to save pose pairs
 
+# Load RealSense intrinsics/distortion from calibration file
+calib = np.load("../output/realsense_calibration.npz")
+K = calib["camera_matrix"]
+dist = calib["dist_coeffs"]
+print(K)
+print(dist)
 
 # =========================
-# Helpers
+# Kalman Filter for 6-DoF Pose
 # =========================
-def to_homogeneous(R, t) -> np.ndarray:
-    T = np.eye(4, dtype=np.float64)
-    T[:3, :3] = R
-    T[:3, 3]  = t.reshape(3)
-    return T
+class PoseKalmanFilter:
+    def __init__(self, process_noise=0.01, measurement_noise=0.1):
+        """
+        Kalman filter for 6-DoF pose tracking
+        State: [x, y, z, qx, qy, qz, qw, vx, vy, vz, wx, wy, wz] (13D)
+        """
+        self.dt = 1.0/30.0  # Assume 30 FPS
+        self.state_dim = 13
+        self.measurement_dim = 7  # [x, y, z, qx, qy, qz, qw]
+        
+        # State vector: [position, quaternion, velocity, angular_velocity]
+        self.x = np.zeros(self.state_dim)
+        self.P = np.eye(self.state_dim) * 10.0  # Covariance matrix
+        
+        # Process noise
+        self.Q = np.eye(self.state_dim) * process_noise
+        
+        # Measurement noise
+        self.R = np.eye(self.measurement_dim) * measurement_noise
+        
+        # Measurement matrix
+        self.H = np.zeros((self.measurement_dim, self.state_dim))
+        self.H[:7, :7] = np.eye(7)  # Direct measurement of pose
+        
+        self.initialized = False
+    
+    def update(self, position, rotation_matrix):
+        """Update filter with new pose measurement"""
+        # Convert rotation matrix to quaternion
+        r = R.from_matrix(rotation_matrix)
+        quat = r.as_quat()  # [x, y, z, w]
+        
+        # Measurement vector
+        z = np.array([position[0], position[1], position[2], 
+                     quat[0], quat[1], quat[2], quat[3]])
+        
+        if not self.initialized:
+            # Initialize state
+            self.x[:3] = position
+            self.x[3:7] = quat
+            self.initialized = True
+            return position, rotation_matrix
+        
+        # Prediction step
+        F = self._get_transition_matrix()
+        self.x = F @ self.x
+        self.P = F @ self.P @ F.T + self.Q
+        
+        # Update step
+        y = z - self.H @ self.x  # Innovation
+        S = self.H @ self.P @ self.H.T + self.R  # Innovation covariance
+        K = self.P @ self.H.T @ np.linalg.inv(S)  # Kalman gain
+        
+        self.x = self.x + K @ y
+        self.P = (np.eye(self.state_dim) - K @ self.H) @ self.P
+        
+        # Extract filtered pose
+        filtered_position = self.x[:3]
+        filtered_quat = self.x[3:7]
+        
+        # Convert quaternion back to rotation matrix
+        r_filtered = R.from_quat(filtered_quat)
+        filtered_rotation = r_filtered.as_matrix()
+        
+        return filtered_position, filtered_rotation
+    
+    def _get_transition_matrix(self):
+        """Get state transition matrix for constant velocity model"""
+        F = np.eye(self.state_dim)
+        F[:3, 7:10] = np.eye(3) * self.dt  # position += velocity * dt
+        return F
 
-def rpy_to_matrix(roll_deg, pitch_deg, yaw_deg) -> np.ndarray:
-    roll, pitch, yaw = np.radians([roll_deg, pitch_deg, yaw_deg])
-    Rx = np.array([[1, 0, 0],
-                   [0, np.cos(roll), -np.sin(roll)],
-                   [0, np.sin(roll),  np.cos(roll)]], dtype=np.float64)
-    Ry = np.array([[ np.cos(pitch), 0, np.sin(pitch)],
-                   [0,              1, 0            ],
-                   [-np.sin(pitch), 0, np.cos(pitch)]], dtype=np.float64)
-    Rz = np.array([[np.cos(yaw), -np.sin(yaw), 0],
-                   [np.sin(yaw),  np.cos(yaw), 0],
-                   [0,            0,           1]], dtype=np.float64)
-    return Rz @ Ry @ Rx
+# =========================
+# Utilities
+# =========================
+def euler_rpy_to_R(roll, pitch, yaw, degrees=True):
+    # Delegate to shared utility. utils.rpy_to_matrix expects degrees.
+    if not degrees:
+        roll = np.degrees(roll); pitch = np.degrees(pitch); yaw = np.degrees(yaw)
+    return rpy_to_matrix(roll, pitch, yaw)
 
-def make_charuco_board(aruco_dict):
-    try:
-        return cv2.aruco.CharucoBoard(
-            (CHARUCO_SQUARES_X, CHARUCO_SQUARES_Y),
-            CHARUCO_SQUARE_LEN_M,
-            CHARUCO_MARKER_LEN_M,
-            aruco_dict
-        )
-    except Exception:
-        return cv2.aruco.CharucoBoard_create(
-            CHARUCO_SQUARES_X, CHARUCO_SQUARES_Y,
-            CHARUCO_SQUARE_LEN_M, CHARUCO_MARKER_LEN_M,
-            aruco_dict
-        )
 
-def make_detector_params(aruco_dict):
-    try:
-        params = cv2.aruco.DetectorParameters()
-        params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
-        detector = cv2.aruco.ArucoDetector(aruco_dict, params)
-        return params, detector
-    except Exception:
-        params = cv2.aruco.DetectorParameters_create()
-        try:
-            params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
-        except Exception:
-            pass
-        return params, None
+# Use shared to_homogeneous from utils instead of local se3
 
-def interpolate_charuco(corners, ids, gray, board, K, dist):
-    """Return (corners_Nx1x2 float32 contiguous, ids_Nx1 int32) or (None, None)."""
-    if ids is None or len(ids) == 0:
-        return None, None
 
-    # Optional refinement against board geometry (improves stability)
-    try:
-        cv2.aruco.refineDetectedMarkers(
-            image=gray, board=board, detectedCorners=corners, detectedIds=ids,
-            rejectedCorners=None, cameraMatrix=K, distCoeffs=dist
-        )
-    except Exception:
-        pass
-
-    out = cv2.aruco.interpolateCornersCharuco(corners, ids, gray, board, K, dist)
-    if not (isinstance(out, tuple) and len(out) >= 2):
-        return None, None
-
-    charuco_corners, charuco_ids = out[0], out[1]
-    if charuco_corners is None or charuco_ids is None:
-        return None, None
-    if len(charuco_corners) == 0 or len(charuco_ids) == 0:
-        return None, None
-
-    # Normalize types/shapes
-    charuco_ids = np.asarray(charuco_ids, dtype=np.int32).reshape(-1, 1)
-    cc = np.asarray(charuco_corners, dtype=np.float32)
-    if cc.ndim == 2 and cc.shape[1] == 2:
-        cc = cc.reshape((-1, 1, 2))
-    cc = np.ascontiguousarray(cc)
-
-    n = min(len(cc), len(charuco_ids))
-    if n < 4:
-        return None, None
-    if len(cc) != len(charuco_ids):
-        cc = cc[:n]
-        charuco_ids = charuco_ids[:n]
-
-    return cc, charuco_ids
-
-def estimate_charuco_pose(charuco_corners, charuco_ids, board, K, dist) -> Tuple[bool, np.ndarray, np.ndarray]:
-    if (charuco_corners is None or charuco_ids is None
-        or len(charuco_corners) != len(charuco_ids)
-        or len(charuco_ids) < 4):
-        return False, None, None
-
-    charuco_corners = np.ascontiguousarray(charuco_corners, dtype=np.float32)
-    charuco_ids     = np.ascontiguousarray(charuco_ids,     dtype=np.int32)
-
-    try:
-        retval, rvec, tvec = cv2.aruco.estimatePoseCharucoBoard(
-            charuco_corners, charuco_ids, board, K, dist, None, None
-        )
-        valid = bool(retval) and rvec is not None and tvec is not None
-        return valid, rvec, tvec
-    except Exception:
-        rvec, tvec = cv2.aruco.estimatePoseCharucoBoard(
-            charuco_corners, charuco_ids, board, K, dist, None, None
-        )
-        valid = (rvec is not None and tvec is not None)
-        return valid, rvec, tvec
+ 
 
 
 # =========================
-# RealSense wrapper
+# RealSense source
 # =========================
 class RealSenseSource:
-    def __init__(self, width=1280, height=720, fps=30):
-        self.pipeline = rs.pipeline()
-        self.config = rs.config()
-        self.config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
-        self.profile = self.pipeline.start(self.config)
-
-        # Keep buffering tiny; avoid driver starvation
-        dev = self.profile.get_device()
-        for s in dev.query_sensors():
-            if s.supports(rs.option.frames_queue_size):
-                s.set_option(rs.option.frames_queue_size, 1)
-            if s.supports(rs.option.auto_exposure_priority):
-                s.set_option(rs.option.auto_exposure_priority, 0)
+    def __init__(self, width=1280, height=800, fps=30, camera_kind: str = "auto"):
+        self.cam = create_camera(kind=camera_kind, width=width, height=height, fps=fps)
 
     def read(self):
-        frames = self.pipeline.poll_for_frames()
-        if not frames:
-            return False, None
-        color_frame = frames.get_color_frame()
-        if not color_frame:
-            return False, None
-        # Deep copy to avoid zero-copy buffer reuse segfaults
-        img = np.array(color_frame.get_data(), copy=True)
-        img = img.reshape((color_frame.get_height(), color_frame.get_width(), 3))
-        return True, img
-
-    def get_color_intrinsics(self):
-        color_stream = self.profile.get_stream(rs.stream.color).as_video_stream_profile()
-        intr = color_stream.get_intrinsics()
-        K = np.array([[intr.fx, 0, intr.ppx],
-                      [0, intr.fy, intr.ppy],
-                      [0, 0, 1]], dtype=np.float64)
-        dist = np.array(intr.coeffs, dtype=np.float64)
-        return K, dist, (intr.width, intr.height)
+        return self.cam.read()
 
     def close(self):
-        self.pipeline.stop()
+        self.cam.close()
 
 
+# =========================
+# Terminal/ASCII helpers moved to terminal_display.Display
+# =========================
+
+# =========================
+# ChArUco with auto dict + firstMarkerId lock-in (no board mutation)
+# =========================
+def _dict_size(dict_id):
+    m = {
+        cv2.aruco.DICT_4X4_50: 50,    cv2.aruco.DICT_4X4_100: 100,
+        cv2.aruco.DICT_4X4_250: 250,  cv2.aruco.DICT_4X4_1000: 1000,
+        cv2.aruco.DICT_5X5_50: 50,    cv2.aruco.DICT_5X5_100: 100,
+        cv2.aruco.DICT_5X5_250: 250,  cv2.aruco.DICT_5X5_1000: 1000,
+    }
+    return m.get(dict_id, 250)
+
+def _make_board_and_detector(dict_id):
+    aruco_dict = cv2.aruco.getPredefinedDictionary(dict_id)
+    params = cv2.aruco.DetectorParameters()
+    # Robust-ish defaults; good for prints/screens
+    params.adaptiveThreshWinSizeMin = 5
+    params.adaptiveThreshWinSizeMax = 75
+    params.adaptiveThreshWinSizeStep = 1
+      # Allow slightly larger   
+    params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+    params.cornerRefinementWinSize = 20       # Larger refinement window
+    params.cornerRefinementMaxIterations = 100 # More iterations
+    params.cornerRefinementMinAccuracy = 0.01 
+    params.detectInvertedMarker = True
+    params.minMarkerPerimeterRate = 0.005      # Allow smaller markers
+    params.maxMarkerPerimeterRate = 6.0 
+    params.adaptiveThreshConstant = 3     
+    params.minCornerDistanceRate = 0.003  
+    params.markerBorderBits = 1  
+    params.useAruco3Detection = True
+
+    detector = cv2.aruco.ArucoDetector(aruco_dict, params)
+    board = cv2.aruco.CharucoBoard(
+        (CHARUCO_SQUARES_X, CHARUCO_SQUARES_Y),
+        SQUARE_LEN_M, MARKER_LEN_M, aruco_dict
+    )
+    return board, detector
+
+_COMMON_DICTS = [
+    cv2.aruco.DICT_4X4_50,
+    cv2.aruco.DICT_4X4_100,
+    cv2.aruco.DICT_4X4_250,
+    cv2.aruco.DICT_4X4_1000,
+]
+
+def make_charuco_state():
+    state = {
+        'locked': False,
+        'dict_id': None,
+        'first_off': None,   # firstMarkerId offset
+        'board': None,
+        'detector': None,
+        'candidates': {},    # dict_id -> (board, detector)
+        'last_markers': 0,
+        'last_charuco': 0,
+        'kalman_filter': PoseKalmanFilter(process_noise=0.01, measurement_noise=0.1),
+    }
+    if ARUCO_DICT_ID is not None:
+        board, det = _make_board_and_detector(ARUCO_DICT_ID)
+        state.update({'locked': True,
+                      'dict_id': ARUCO_DICT_ID,
+                      'first_off': (FIRST_MARKER_ID or 0),
+                      'board': board,
+                      'detector': det})
+    return state
+
+def _adjust_ids(ids, offset, dict_sz):
+    # ids is shape (N,1); keep shape
+    ids_i = ids.astype(np.int32)
+    ids_adj = ((ids_i - int(offset)) % dict_sz).astype(np.int32)
+    return ids_adj
+
+def estimate_charuco_pose(undistorted_img, K, dist, debug_img=None, state=None):
+    """
+    Auto-lock dictionary and firstMarkerId from observed IDs.
+    Returns (R, t) or None. Updates state['last_markers'], state['last_charuco'].
+    Note: undistorted_img should be the undistorted image for accurate detection.
+    """
+    assert state is not None
+
+    def draw_counts(img, markers, charuco):
+        cv2.putText(img, f"markers:{markers}", (20,100), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,0), 2)
+        cv2.putText(img, f"charuco:{charuco}", (20,130), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,255), 2)
+
+    if not state['locked']:
+        # try each common dict
+        for did in _COMMON_DICTS if ARUCO_DICT_ID is None else [ARUCO_DICT_ID]:
+            if did not in state['candidates']:
+                state['candidates'][did] = _make_board_and_detector(did)
+            board, det = state['candidates'][did]
+
+            corners, ids, _ = det.detectMarkers(undistorted_img)
+            state['last_markers'] = 0 if ids is None else int(len(ids))
+            
+            # Apply subpixel refinement to marker corners
+            if corners is not None and len(corners) > 0:
+                gray_img = cv2.cvtColor(undistorted_img, cv2.COLOR_BGR2GRAY)
+                refined_corners = []
+                for i in range(len(corners)):
+                    refined_corner = cv2.cornerSubPix(gray_img, corners[i], (7, 7), (-1, -1), 
+                                                    (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 0.001))
+                    refined_corners.append(refined_corner)
+                corners = refined_corners
+            
+            if debug_img is not None and ids is not None and len(ids) > 0:
+                cv2.aruco.drawDetectedMarkers(debug_img, corners, ids)
+
+            if ids is None or len(ids) < 4:
+                if debug_img is not None:
+                    draw_counts(debug_img, state['last_markers'], 0)
+                continue
+
+            dict_sz = _dict_size(did)
+            guess_off = int(np.min(ids)) if FIRST_MARKER_ID is None else int(FIRST_MARKER_ID)
+            ids_adj = _adjust_ids(ids, guess_off, dict_sz)
+
+            retval, ch_corners, ch_ids = cv2.aruco.interpolateCornersCharuco(corners, ids_adj, undistorted_img, board)
+            state['last_charuco'] = 0 if (retval is None) else int(retval)
+            if retval is None or retval < 10:
+                if debug_img is not None:
+                    draw_counts(debug_img, state['last_markers'], state['last_charuco'])
+                continue
+
+            # Additional subpixel refinement for ChArUco corners
+            if ch_corners is not None and len(ch_corners) > 0:
+                # Convert to float32 for subpixel refinement
+                ch_corners_float = np.array(ch_corners, dtype=np.float32)
+                # Convert BGR to grayscale for subpixel refinement
+                gray_img = cv2.cvtColor(undistorted_img, cv2.COLOR_BGR2GRAY)
+                # Apply subpixel corner refinement
+                cv2.cornerSubPix(gray_img, ch_corners_float, (5, 5), (-1, -1), 
+                                (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.1))
+                ch_corners = ch_corners_float
+
+            ok, rvec, tvec = cv2.aruco.estimatePoseCharucoBoard(ch_corners, ch_ids, board, K, dist, None, None)
+            if not ok:
+                if debug_img is not None:
+                    draw_counts(debug_img, state['last_markers'], state['last_charuco'])
+                continue
+
+            # Apply Kalman filter to reduce jitter
+            R_measured, _ = cv2.Rodrigues(rvec)
+            t_measured = tvec.reshape(3)
+            t_filtered, R_filtered = state['kalman_filter'].update(t_measured, R_measured)
+
+            # Lock in
+            state.update({'locked': True, 'dict_id': did, 'first_off': guess_off,
+                          'board': board, 'detector': det})
+            print(f"[ChArUco] Locked dict={did}, firstMarkerId={guess_off}, "
+                  f"markers={len(ids)}, charuco={int(retval)}")
+
+            if debug_img is not None:
+                cv2.aruco.drawDetectedCornersCharuco(debug_img, ch_corners, ch_ids)
+                draw_counts(debug_img, state['last_markers'], state['last_charuco'])
+
+            return R_filtered, t_filtered
+
+        return None
+
+    # locked path: reuse board/detector and adjust ids each time
+    board, det = state['board'], state['detector']
+    corners, ids, _ = det.detectMarkers(undistorted_img)
+    state['last_markers'] = 0 if ids is None else int(len(ids))
+    
+    # Apply subpixel refinement to marker corners
+    if corners is not None and len(corners) > 0:
+        gray_img = cv2.cvtColor(undistorted_img, cv2.COLOR_BGR2GRAY)
+        refined_corners = []
+        for i in range(len(corners)):
+            refined_corner = cv2.cornerSubPix(gray_img, corners[i], (5, 5), (-1, -1), 
+                                            (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.1))
+            refined_corners.append(refined_corner)
+        corners = refined_corners
+    
+    if debug_img is not None and ids is not None and len(ids) > 0:
+        cv2.aruco.drawDetectedMarkers(debug_img, corners, ids)
+
+    if ids is None or len(ids) < 4:
+        if debug_img is not None:
+            draw_counts(debug_img, state['last_markers'], 0)
+        return None
+
+    dict_sz = _dict_size(state['dict_id'])
+    ids_adj = _adjust_ids(ids, state['first_off'], dict_sz)
+
+    retval, ch_corners, ch_ids = cv2.aruco.interpolateCornersCharuco(corners, ids_adj, undistorted_img, board)
+    state['last_charuco'] = 0 if (retval is None) else int(retval)
+    if retval is None or retval < 10:
+        if debug_img is not None:
+            draw_counts(debug_img, state['last_markers'], state['last_charuco'])
+        return None
+
+    # Additional subpixel refinement for ChArUco corners
+    if ch_corners is not None and len(ch_corners) > 0:
+        # Convert to float32 for subpixel refinement
+        ch_corners_float = np.array(ch_corners, dtype=np.float32)
+        # Convert BGR to grayscale for subpixel refinement
+        gray_img = cv2.cvtColor(undistorted_img, cv2.COLOR_BGR2GRAY)
+        # Apply subpixel corner refinement
+        cv2.cornerSubPix(gray_img, ch_corners_float, (5, 5), (-1, -1), 
+                        (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.1))
+        ch_corners = ch_corners_float
+
+    ok, rvec, tvec = cv2.aruco.estimatePoseCharucoBoard(ch_corners, ch_ids, board, K, dist, None, None)
+    if not ok:
+        if debug_img is not None:
+            draw_counts(debug_img, state['last_markers'], state['last_charuco'])
+        return None
+
+    # Apply Kalman filter to reduce jitter
+    R_measured, _ = cv2.Rodrigues(rvec)
+    t_measured = tvec.reshape(3)
+    t_filtered, R_filtered = state['kalman_filter'].update(t_measured, R_measured)
+
+    if debug_img is not None:
+        cv2.aruco.drawDetectedCornersCharuco(debug_img, ch_corners, ch_ids)
+        draw_counts(debug_img, state['last_markers'], state['last_charuco'])
+
+    return R_filtered, t_filtered
+
+# =========================
+# xArm client
+# =========================
+class XArmClient:
+    def __init__(self, ip):
+        self.arm = XArmAPI(ip)
+        self.arm.connect()
+        # self.arm.motion_enable(True)
+        # self.arm.set_mode(0)
+        # self.arm.set_state(0)
+
+    def get_base_to_gripper(self):
+        code, pos = self.arm.get_position(is_radian=not USE_DEG)
+        if code != 0:
+            raise RuntimeError(f"xArm get_position failed, code={code}")
+        x, y, z, roll, pitch, yaw = pos
+        t_bg = np.array([x, y, z], dtype=np.float64) / 1000.0  # mm -> m
+        R_bg = euler_rpy_to_R(roll, pitch, yaw, degrees=USE_DEG)
+        return R_bg, t_bg
+
+    def close(self):
+        try: self.arm.disconnect()
+        except Exception: pass
+
+# =========================
+# Residual diagnostics
+# =========================
+def handeye_residuals(Rg, tg, Rt, tt, R_cam2base, t_cam2base):
+    """
+    Calculate residuals for eye-in-hand hand-eye calibration.
+    Rg: gripper poses in base frame (camera poses in base frame)
+    tg: gripper translations in base frame
+    Rt: target poses in camera frame
+    tt: target translations in camera frame
+    R_cam2base, t_cam2base: camera to base transformation
+    """
+    X = to_homogeneous(R_cam2base, t_cam2base)
+    rots, trans = [], []
+    for i in range(len(Rg) - 1):
+        RA, tA = rel_motion(Rg[i], tg[i], Rg[i+1], tg[i+1])
+        RB, tB = rel_motion(Rt[i+1], tt[i+1], Rt[i], tt[i])  # inverse order
+        L = to_homogeneous(RA, tA) @ X
+        Rhs = X @ to_homogeneous(RB, tB)
+        dR = L[:3,:3].T @ Rhs[:3,:3]
+        dtheta = rot_angle_deg(dR)
+        dt = np.linalg.norm(L[:3,3] - Rhs[:3,3])
+        rots.append(dtheta); trans.append(dt)
+    if not rots: return None
+    def stats(a): a=np.array(a); return dict(mean=float(np.mean(a)),
+                                            median=float(np.median(a)),
+                                            p95=float(np.percentile(a,95)))
+    return dict(rot_deg=stats(rots), trans_m=stats(trans))
+    
+    # Keeping residuals only; defer detailed validation to MoveArm3.py
+    
 # =========================
 # Main
 # =========================
 def main():
-    # Connect robot
-    arm = XArmAPI(XARM_IP)
-    arm.motion_enable(True)
+    parser = argparse.ArgumentParser(description="Eye-in-Hand hand-eye calibration (terminal-friendly)")
+    parser.add_argument("--mode", choices=["gui", "ascii", "ascii_hi", "headless"],
+                        default=("gui" if os.environ.get("DISPLAY") else "ascii"),
+                        help="Display mode: OpenCV GUI, ASCII in terminal, or headless")
+    parser.add_argument("--camera", choices=["auto", "realsense", "opencv", "orbbec"], default="auto",
+                        help="Camera backend to use: RealSense (if available) or OpenCV UVC")
+    args = parser.parse_args()
 
-    # Load saved intrinsics if available (we'll compare with live)
-    saved_K = saved_dist = None
-    if os.path.exists(SAVED_INTR_PATH):
-        with np.load(SAVED_INTR_PATH) as data:
-            saved_K   = data["camera_matrix"].astype(np.float64)
-            saved_dist= data["dist_coeffs"].astype(np.float64)
-
-    # ArUco/ChArUco
-    aruco_dict = cv2.aruco.getPredefinedDictionary(ARUCO_DICT_ID)
-    board = make_charuco_board(aruco_dict)
-    params, detector = make_detector_params(aruco_dict)
-
-    # Pose pair buffers
-    R_gripper2base, t_gripper2base = [], []
-    R_target2cam,  t_target2cam  = [], []
-
-    os.makedirs(SAVE_DIR, exist_ok=True)
-
-    # Load previous samples (with migration from dtype=object)
-    if os.path.exists(SAMPLE_PATH):
-        prev = np.load(SAMPLE_PATH, allow_pickle=True)
-        def _to_list(key, tail_shape):
-            arr = prev[key]
-            if arr.dtype == object:
-                arr = np.stack(list(arr), axis=0)
-            arr = np.asarray(arr, dtype=np.float64)
-            assert arr.shape[-len(tail_shape):] == tail_shape, f"{key} shape mismatch"
-            return [arr[i] for i in range(arr.shape[0])]
-        try:
-            R_gripper2base = _to_list('R_gripper2base', (3,3))
-            t_gripper2base = _to_list('t_gripper2base', (3,))
-            R_target2cam   = _to_list('R_target2cam',   (3,3))
-            t_target2cam   = _to_list('t_target2cam',   (3,))
-            print(f"[INFO] Loaded {len(R_gripper2base)} previous samples.")
-        except Exception as e:
-            print(f"[WARN] Failed to migrate old samples: {e}. Starting fresh.")
-            R_gripper2base, t_gripper2base, R_target2cam, t_target2cam = [], [], [], []
+    print("\n=== Instructions ===")
+    print("• Mount RealSense rigidly on the gripper (eye-in-hand).")
+    print("• Fix ChArUco board rigidly in the environment.")
+    print("• Move to varied poses (large rotations + translations).")
+    if args.mode == "gui":
+        print("• Press [SPACE] to capture, [q] to finish in the GUI window.\n")
     else:
-        print("[INFO] No previous samples. Starting fresh.")
+        print("• In terminal, press SPACE to capture, q to finish.\n")
 
-    pose_count = len(R_gripper2base)
-    print("[INFO] Move robot to varied poses. Press 's' to save, 'q' to calibrate/quit.")
+    print("Opening camera...")
+    rs_cam = RealSenseSource(REALSENSE_WIDTH, REALSENSE_HEIGHT, REALSENSE_FPS, camera_kind=args.camera)
 
-    # Graceful Ctrl+C
-    stop = {"flag": False}
-    def _sigint(_, __): stop["flag"] = True
-    signal.signal(signal.SIGINT, _sigint)
+    print("Connecting xArm...")
+    xarm = XArmClient(XARM_IP)
 
-    rs_cam = None
-    last_valid = {"rvec": None, "tvec": None, "have_pose": False}
+    ch_state = make_charuco_state()
+    R_g2b_list, t_g2b_list = [], []  # gripper to base (camera pose)
+    R_t2c_list, t_t2c_list = [], []  # target to camera
+    captured_images = []  # Store captured images for saving
 
+    last_Rg, last_tg = None, None
+
+    display = Display(args.mode)
     try:
-        rs_cam = RealSenseSource(REALSENSE_WIDTH, REALSENSE_HEIGHT, REALSENSE_FPS)
-        K_live, dist_live, (w_live, h_live) = rs_cam.get_color_intrinsics()
-        if saved_K is not None:
-            if np.linalg.norm(saved_K - K_live) > 1e-2:
-                print("⚠️  Saved intrinsics differ from live stream. Using LIVE intrinsics.")
-        K, dist = K_live, dist_live
-
-        while not stop["flag"]:
-            ok, frame = rs_cam.read()
-            if not ok:
-                # keep UI responsive even if no frame
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    break
-                continue
-
-            # ArUco detection on grayscale
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-            if detector is not None:
-                corners, ids, _ = detector.detectMarkers(gray)
-            else:
-                corners, ids, _ = cv2.aruco.detectMarkers(gray, aruco_dict, parameters=params)
-
-            if ids is not None and len(ids) > 0:
-                cv2.aruco.drawDetectedMarkers(frame, corners, ids)
-
-                charuco_corners, charuco_ids = interpolate_charuco(corners, ids, gray, board, K, dist)
-                if charuco_corners is not None:
-                    valid, rvec, tvec = estimate_charuco_pose(charuco_corners, charuco_ids, board, K, dist)
-                    if valid:
-                        cv2.drawFrameAxes(frame, K, dist, rvec, tvec, AXIS_LEN_M)  # Board → Camera
-                        last_valid.update({"rvec": rvec, "tvec": tvec, "have_pose": True})
-                    else:
-                        last_valid["have_pose"] = False
-                else:
-                    last_valid["have_pose"] = False
-            else:
-                last_valid["have_pose"] = False
-
-            # HUD
-            cv2.putText(frame, f"samples: {pose_count}", (15, 35),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2, cv2.LINE_AA)
-            cv2.putText(frame, "Press 's' to save pose, 'q' to run calibration",
-                        (15, frame.shape[0]-20), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
-
-            cv2.imshow('ChArUco Eye-in-Hand (RealSense Color)', frame)
-            key = cv2.waitKey(1) & 0xFF
-
-            if key == ord('s'):
-                if last_valid["have_pose"]:
-                    # Board → Camera
-                    R_board_cam, _ = cv2.Rodrigues(last_valid["rvec"])
-                    t_board_cam = last_valid["tvec"].reshape(3).astype(np.float64)
-
-                    # Gripper → Base (mm + RPY deg from xArm)
-                    code, pose = arm.get_position()
-                    if code != 0 or pose is None:
-                        print("[ERROR] Failed to read robot pose; sample not saved.")
-                    else:
-                        t_grip_base_m = np.array(pose[:3], dtype=np.float64) / 1000.0
-                        R_grip_base   = rpy_to_matrix(pose[3], pose[4], pose[5])
-
-                        R_gripper2base.append(R_grip_base)
-                        t_gripper2base.append(t_grip_base_m)
-                        R_target2cam.append(R_board_cam)
-                        t_target2cam.append(t_board_cam)
-
-                        pose_count += 1
-                        print(f"[INFO] Pose #{pose_count} saved.")
-
-                        # Save as numeric arrays (no dtype=object)
-                        np.savez(SAMPLE_PATH,
-                                 R_gripper2base=np.stack(R_gripper2base, axis=0),
-                                 t_gripper2base=np.stack(t_gripper2base, axis=0),
-                                 R_target2cam=np.stack(R_target2cam, axis=0),
-                                 t_target2cam=np.stack(t_target2cam, axis=0))
-                        print(f"[INFO] Samples written to {SAMPLE_PATH}")
-                else:
-                    print("[WARN] No valid ChArUco pose; hold steady and try again.")
-            elif key == ord('q'):
+        while True:
+            ok, color = rs_cam.read()
+            if not ok or color is None:
+                print("Camera read failed")
                 break
 
+            # Undistort the image for accurate ArUco detection
+            undistorted = cv2.undistort(color, K, dist)
+            vis = undistorted.copy()
+            det = estimate_charuco_pose(undistorted, K, dist, debug_img=vis, state=ch_state)
+
+            if det is not None:
+                R, t = det
+                if args.mode in ("ascii", "ascii_hi", "headless"):
+                    draw_axes_ascii_friendly(vis, K, dist, R, t, AXIS_LEN_M, thickness=6)
+                else:
+                    cv2.drawFrameAxes(vis, K, dist, cv2.Rodrigues(R)[0], t.reshape(3,1), AXIS_LEN_M)
+                cv2.putText(vis, "Board detected", (20,30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,255,0), 2)
+            else:
+                cv2.putText(vis, "No board", (20,30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,0,255), 2)
+
+            cap_txt = f"Captures: {len(R_g2b_list)} / {TARGET_SAMPLES}"
+            cv2.putText(vis, cap_txt, (20,60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
+
+            status = f"Captures: {len(R_g2b_list)}/{TARGET_SAMPLES}  |  {'Board detected' if det is not None else 'No board'}  |  [SPACE]=capture, q=quit"
+            key = display.update(vis, status)
+
+            if key == 'q':
+                break
+            if key == ' ':
+                if det is None:
+                    print("⚠️  Need the board detected. Adjust and try again.")
+                    continue
+                try:
+                    R_bg, t_bg = xarm.get_base_to_gripper()
+                    #R_bg, t_bg = np.eye(3), np.zeros(3)
+                except Exception as e:
+                    print(f"⚠️  xArm read failed: {e}")
+                    continue
+
+                # In eye-in-hand: camera is on gripper, so gripper pose = camera pose
+                R_g2b = R_bg  # gripper to base (same as camera to base)
+                t_g2b = t_bg
+
+                accept = True
+                if last_Rg is not None:
+                    dR, dt = rel_motion(last_Rg, last_tg, R_g2b, t_g2b)
+                    ang = rot_angle_deg(dR); d = np.linalg.norm(dt)
+                    if ang < MIN_ANGLE_DEG and d < MIN_TRANS_M:
+                        print(f"Pose too similar (Δang={ang:.1f}°, Δt={d*1000:.1f} mm); move more.")
+                        accept = False
+
+                if accept:
+                    R_g2b_list.append(R_g2b); t_g2b_list.append(t_g2b)
+                    R, t = det
+                    R_t2c_list.append(R); t_t2c_list.append(t)
+                    captured_images.append(color.copy())  # Store the captured image
+                    last_Rg, last_tg = R_g2b, t_g2b
+                    
+                    # Save pose pair immediately
+                    pose_num = len(R_g2b_list)
+                    
+                    # Create directory if it doesn't exist
+                    os.makedirs(SAVE_DIR, exist_ok=True)
+                    
+                    # Convert rotation matrices to Euler angles for saving
+                    R_g2b_euler = cv2.Rodrigues(R_g2b)[0]
+                    R_t2c_euler = cv2.Rodrigues(R)[0]  # Use R from det
+                    
+                    # Calculate base to gripper transformation (inverse of gripper to base)
+                    R_base2gripper, t_base2gripper = invert_rt(R_g2b, t_g2b)
+                    
+                    # Save as JPG
+                    img_name = f"{SAVE_DIR}/pose{pose_num:03d}.jpg"
+                    cv2.imwrite(img_name, captured_images[-1])
+                    
+                    # Save as NPY with base to gripper transformation
+                    np.save(f"{SAVE_DIR}/pose{pose_num:03d}.npy", {
+                        "R_base2gripper": R_base2gripper,      # Base to gripper rotation
+                        "t_base2gripper": t_base2gripper,      # Base to gripper translation
+                        "R_gripper2base": R_g2b,               # Original gripper to base (for reference)
+                        "t_gripper2base": t_g2b,               # Original gripper to base (for reference)
+                        "R_target2cam": R,                      # Target to camera (from det)
+                        "t_target2cam": t,                      # Target to camera (from det)
+                        "R_base2gripper_euler": cv2.Rodrigues(R_base2gripper)[0],  # Base to gripper in Euler angles
+                        "R_target2cam_euler": R_t2c_euler,                         # Target to camera in Euler angles
+                        "pose_number": pose_num,
+                        "timestamp": pose_num  # You could add actual timestamp here if needed
+                    }, allow_pickle=True)
+                    
+                    
+                    print(f"Captured #{pose_num}  (markers:{ch_state['last_markers']}, charuco:{ch_state['last_charuco']})")
+                    print(f"Saved → {img_name}")
+                    print(f"Saved → {SAVE_DIR}/pose{pose_num:03d}.npy")
     finally:
-        cv2.destroyAllWindows()
+        display.close()
+        rs_cam.close()
+        # xarm.close()
+
+    n = len(R_g2b_list)
+    if n < MIN_SAMPLES:
+        print(f"Not enough samples ({n}). Aim for {TARGET_SAMPLES}+ varied poses.")
+        return
+
+    Rg, tg = to_cv_lists(R_g2b_list, t_g2b_list)
+    Rt, tt = to_cv_lists(R_t2c_list, t_t2c_list)
+    print("\nRunning hand-eye calibration (eye-in-hand)...")
+    
+    # Try different calibration methods
+    methods = [
+        (cv2.CALIB_HAND_EYE_TSAI, "TSAI"),
+        (cv2.CALIB_HAND_EYE_PARK, "PARK"),
+        (cv2.CALIB_HAND_EYE_HORAUD, "HORAUD"),
+        (cv2.CALIB_HAND_EYE_DANIILIDIS, "DANIILIDIS")
+    ]
+    
+    calibration_results = {}
+    
+    for method, name in methods:
         try:
-            if rs_cam is not None:
-                rs_cam.close()
-        except Exception:
-            pass
-        try:
-            arm.disconnect()
-        except Exception:
-            pass
-
-    # --------------- Solve Eye-in-Hand ---------------
-    if pose_count >= 3:
-        print("\n[INFO] Running eye-in-hand calibration...")
-        # cv2.calibrateHandEye expects lists of R (3x3) and t (3x1)
-        R_cam2gripper, t_cam2gripper = cv2.calibrateHandEye(
-            R_gripper2base,
-            [t.reshape(3, 1) for t in t_gripper2base],
-            R_target2cam,
-            [t.reshape(3, 1) for t in t_target2cam]
-        )
-
-        T_cam_gripper = to_homogeneous(R_cam2gripper, t_cam2gripper.reshape(3))
-        T_gripper_cam = np.linalg.inv(T_cam_gripper)
-
-        print("\n=== Calibration Result (Eye-in-Hand) ===")
-        print("T_cam_gripper (Camera → Gripper):\n", T_cam_gripper)
-        print("\nT_gripper_cam (Gripper → Camera):\n", T_gripper_cam)
-
-        np.savez(OUT_CALIB_PATH, T_cam_gripper=T_cam_gripper, T_gripper_cam=T_gripper_cam)
-        print(f"\n✅ Saved: {OUT_CALIB_PATH}")
+            R, t = cv2.calibrateHandEye(
+                R_gripper2base=Rg, t_gripper2base=tg,  # Camera poses in base frame
+                R_target2cam=Rt,  t_target2cam=tt,     # Target poses in camera frame
+                method=method
+            )
+            t = t.reshape(3)
+            calibration_results[name] = {
+                'R': R,
+                't': t,
+                'method': method
+            }
+            print(f"Method {name} → t={t}, R={R}")
+        except Exception as e:
+            print(f"Method {name} failed: {e}")
+            calibration_results[name] = None
+    
+    # Use PARK method as default (most commonly used)
+    if calibration_results.get('PARK') is not None:
+        R_cam2base = calibration_results['PARK']['R']
+        t_cam2base = calibration_results['PARK']['t']
+        print(f"\nUsing PARK method as default")
     else:
-        print("❌ Not enough pose samples! Need at least 3 (8–15 recommended).")
+        # Fallback to first available method
+        for name, result in calibration_results.items():
+            if result is not None:
+                R_cam2base = result['R']
+                t_cam2base = result['t']
+                print(f"\nUsing {name} method as fallback")
+                break
+        else:
+            raise RuntimeError("All calibration methods failed")
 
+    # For eye-in-hand: camera is mounted on gripper
+    # We want the transformation from camera frame to gripper frame
+    # This is the fixed offset between camera and gripper TCP
+    # We can calculate this from the calibration results
+    
+    # Since we have gripper poses in base frame and camera poses in base frame,
+    # we can find the camera-to-gripper transformation
+    # T_gripper2base = T_cam2base * T_gripper2cam
+    # Therefore: T_gripper2cam = inv(T_cam2base) * T_gripper2base
+    # And: T_cam2gripper = inv(T_gripper2cam)
+    
+    # For now, let's use the first pose to calculate this relationship
+    if len(R_g2b_list) > 0:
+        R_gripper2base = R_g2b_list[0]  # First gripper pose
+        t_gripper2base = t_g2b_list[0]
+        
+        # T_gripper2base = T_cam2base * T_gripper2cam
+        # T_gripper2cam = inv(T_cam2base) * T_gripper2base
+        T_cam2base_4x4 = np.eye(4)
+        T_cam2base_4x4[:3,:3] = R_cam2base
+        T_cam2base_4x4[:3,3] = t_cam2base
+        
+        T_gripper2base_4x4 = np.eye(4)
+        T_gripper2base_4x4[:3,:3] = R_gripper2base
+        T_gripper2base_4x4[:3,3] = t_gripper2base
+        
+        # T_gripper2cam = inv(T_cam2base) * T_gripper2base
+        T_gripper2cam = np.linalg.inv(T_cam2base_4x4) @ T_gripper2base_4x4
+        
+        # T_cam2gripper = inv(T_gripper2cam)
+        T_cam2gripper = np.linalg.inv(T_gripper2cam)
+        
+        R_cam2gripper = T_cam2gripper[:3,:3]
+        t_cam2gripper = T_cam2gripper[:3,3]
+    else:
+        # Fallback if no poses captured
+        R_cam2gripper = np.eye(3)
+        t_cam2gripper = np.zeros(3)
+        T_cam2gripper = np.eye(4)
+
+    np.set_printoptions(precision=6, suppress=True)
+    print("\n=== T_cam2gripper (camera to gripper transformation) ===")
+    print(T_cam2base_4x4)
+    print("\n=== t_cam2gripper (translation vector) ===")
+    print(t_cam2base)
+    
+    # Determine the selected method name
+    selected_method = "PARK" if calibration_results.get('PARK') is not None else "FALLBACK"
+    if selected_method == "FALLBACK":
+        for method_name, result in calibration_results.items():
+            if result is not None:
+                selected_method = method_name
+                break
+    
+    # Save all calibration results with method name
+    save_data = {
+        "t_cam2grip": t_cam2base,
+        "R_cam2grip": R_cam2base,
+        "T_cam2grip": T_cam2base_4x4,
+        "all_methods": calibration_results,
+        "selected_method": selected_method
+    }
+    
+    # Save with method name in filename
+    method_filename = f"eyeinhand_{selected_method.lower()}"
+    np.save(f"{SAVE_DIR}/result_{method_filename}.npy", save_data, allow_pickle=True)
+    np.savez(f"../output/{method_filename}.npz", **save_data)
+    
+    # Save individual method results with descriptive names
+    for method_name, result in calibration_results.items():
+        if result is not None:
+            method_data = {
+                f"R_{method_name.lower()}": result['R'],
+                f"t_{method_name.lower()}": result['t'],
+                f"method_{method_name.lower()}": result['method'],
+                "method_name": method_name,
+                "T_cam2grip": to_homogeneous(result['R'], result['t'])
+            }
+            np.savez(f"{SAVE_DIR}/calibration_{method_name.lower()}.npz", **method_data)
+            np.savez(f"../output/eyeinhand_{method_name.lower()}.npz", **method_data)
+
+    res = handeye_residuals(Rg, tg, Rt, tt, R_cam2base, t_cam2base)
+    if res:
+        print("\nResiduals: "
+              f"rot mean={res['rot_deg']['mean']:.3f}°, med={res['rot_deg']['median']:.3f}°, p95={res['rot_deg']['p95']:.3f}°; "
+              f"trans mean={res['trans_m']['mean']:.4f} m, med={res['trans_m']['median']:.4f} m, p95={res['trans_m']['p95']:.4f} m")
+
+    print(f"\n=== Eye-in-hand calibration complete ===")
+    print(f"Total poses captured: {len(R_g2b_list)}")
+    print(f"Pose pairs saved to: {SAVE_DIR}")
+    print(f"Main calibration result saved to: ../output/{method_filename}.npz")
+    print(f"Individual method results saved to: ../output/eyeinhand_{{method}}.npz")
+    
+    # Print summary of all methods
+    print(f"\n=== Calibration Methods Summary ===")
+    for method_name, result in calibration_results.items():
+        if result is not None:
+            print(f"{method_name}: t={result['t']}, R_det={np.linalg.det(result['R']):.6f}")
+        else:
+            print(f"{method_name}: FAILED")
 
 if __name__ == "__main__":
     main()

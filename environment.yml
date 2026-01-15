@@ -1,0 +1,47 @@
+name: aruco_calibration
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  # Python version
+  - python=3.9
+  
+  # Core scientific computing
+  - numpy=2.0.2
+  # - numpy<=2.0.0
+  - scipy>=1.13.1
+  - matplotlib>=3.9.4
+  
+  # Pip dependencies that are not available in conda
+  - pip
+  - pip:
+    # OpenCV with contrib modules for ArUco detection
+    - opencv-python==4.12.0.88
+    - opencv-contrib-python==4.12.0.88
+    
+    # Intel RealSense camera support
+    - pyrealsense2==2.56.5.9235
+    
+    # xArm robot control
+    - xarm-python-sdk
+
+# Environment description:
+# This environment is designed for ArUco marker detection and camera calibration
+# using Intel RealSense cameras and xArm robotic arms.
+#
+# Key features:
+# - OpenCV with ArUco marker detection capabilities
+# - Intel RealSense camera integration
+# - xArm robot control
+# - Hand-eye calibration support
+# - ChArUco board detection and pose estimation
+#
+# Usage:
+# conda env create -f environment.yml
+# conda activate aruco_calibration
+#
+# Main scripts:
+# - TakePic2.py: Eye-in-hand calibration data collection
+# - RealsenseIntrinsics.py: Camera intrinsic calibration
+# - EyeInHand.py: Eye-in-hand calibration workflow
+# - utils.py: Utility functions for transformations
